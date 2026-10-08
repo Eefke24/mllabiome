@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from pathlib import Path
+import matplotlib
+matplotlib.use('Agg')
 
 from sklearn.ensemble import ExtraTreesClassifier, RandomForestClassifier
 from sklearn.multioutput import MultiOutputClassifier
+from sklearn.linear_model import RidgeClassifier
 from xgboost import XGBClassifier
 
 from mllabiome import mll
@@ -13,16 +16,21 @@ TITLE = "Mindset Multi-Label Microbiome Sweep"
 EXPERIMENT_DIR = HERE / "runs" / "Mindset-Simulation"
 
 METADATA = mll.Metadata(
-    metadata_path=HERE / "data" / "MINDset_simulation" / "MIND_metadata_simulation.csv",
+    metadata_path=HERE / "data" / "MINDset_simulation" / "mllabiome_metadata.tsv",
 )
 
 DATA = mll.Data(
-    abundance_path=HERE / "data" / "MINDset_simulation" / "MIND_profiles_simulation.csv",
+    abundance_path=HERE / "data" / "MINDset_simulation" / "mllabiome_simulation_data_exclusive.tsv",
     metadata=METADATA,
-    format="metaphlan_csv",
+    format="metaphlan_tsv",
     sample_id_col="sampleID", 
-    target_col=("Mood", "ASD", "ADHD", "Anxiety", "SUD"),
-    task="multilabel_classification", 
+    target_col = "Mood",
+    task = "classification",
+    class_labels=("0", "1"),
+    positive_class="1",
+    subject_id_col="sampleID",
+    # target_col=("Mood", "ASD", "ADHD", "Anxiety", "SUD"),
+    # task="multilabel_classification", 
 )
 
 # 3. EXPLORE CONFIGURATION
@@ -47,10 +55,9 @@ RESOLUTIONS = (
 
 COUNT_TRANSFORMATIONS = (
     mll.Transformation("relative_abundance", composition_scope="joint"),
-    mll.Transformation("rlr", composition_scope="joint"),
+    mll.Transformation("clr", composition_scope="joint"),
 )
 
-# (multi-label compatible)
 MODELS = (
     (
         "RF_1000_msl5",
@@ -72,26 +79,76 @@ MODELS = (
         ),
     ),
     (
-        # Wrapping XGBoost to handle multi-label outputs natively
-        "XGB_Multi_250_lr0.1",
-        MultiOutputClassifier(
-            XGBClassifier(
-                learning_rate=0.1,
-                n_estimators=250,
-                max_depth=3,
-                objective="binary:logistic",
-                eval_metric="logloss",
-                n_jobs=1,
-                random_state=42,
-            )
+        "XGB_250_lr0.1",
+        XGBClassifier(
+            learning_rate=0.1,
+            n_estimators=250,
+            max_depth=3,
+            objective="binary:logistic",
+            eval_metric="logloss",
+            n_jobs=1,
+            random_state=42,
+        )
+    ),
+    (
+        "Ridge_Base",
+        RidgeClassifier(
+            class_weight="balanced",
+            random_state=42,
         )
     ),
 )
 
+# (multi-label compatible)
+# MODELS = (
+#     (
+#         "RF_1000_msl5",
+#         RandomForestClassifier(
+#             n_estimators=1000,
+#             min_samples_leaf=5,
+#             n_jobs=1,
+#             random_state=42,
+#         ),
+#     ),
+#     (
+#         "ExtraTrees_1000_msl5",
+#         ExtraTreesClassifier(
+#             n_estimators=1000,
+#             min_samples_leaf=5,
+#             max_features="sqrt",
+#             n_jobs=1,
+#             random_state=42,
+#         ),
+#     ),
+#     (
+#         # Wrapping XGBoost to handle multi-label outputs natively
+#         "XGB_Multi_250_lr0.1",
+#         MultiOutputClassifier(
+#             XGBClassifier(
+#                 learning_rate=0.1,
+#                 n_estimators=250,
+#                 max_depth=3,
+#                 objective="binary:logistic",
+#                 eval_metric="logloss",
+#                 n_jobs=1,
+#                 random_state=42,
+#             )
+#         )
+#     ),
+# )
 
-EVALUATION = mll.Evaluation.benchmark(
+
+# EVALUATION = mll.Evaluation.benchmark(
+#     optimize_metric="log_loss",
+#     n_jobs="auto",
+# )
+
+EVALUATION = mll.Evaluation(
     optimize_metric="log_loss",
-    n_jobs="auto",
+    outer_folds=2,      # Minimal folds for a fast test
+    inner_folds=2,      # Minimal inner folds
+    repeats=1,          # No repeating for the test run
+    n_jobs=1            # Set to 1 to easily read terminal errors if they happen
 )
 
 
