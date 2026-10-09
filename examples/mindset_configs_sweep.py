@@ -145,10 +145,10 @@ MODELS = (
 
 EVALUATION = mll.Evaluation(
     optimize_metric="log_loss",
-    outer_folds=2,      # Minimal folds for a fast test
-    inner_folds=2,      # Minimal inner folds
-    repeats=1,          # No repeating for the test run
-    n_jobs=1            # Set to 1 to easily read terminal errors if they happen
+    outer_folds=5,      
+    inner_folds=3,      
+    repeats=2,          
+    n_jobs=8            
 )
 
 
@@ -176,7 +176,6 @@ EXPLAINABILITY = mll.Explainability(
     profile="screening",
     methods=(
         mll.Permutation(),
-        mll.SHAP(),
     ),
     classes="auto",
 )
