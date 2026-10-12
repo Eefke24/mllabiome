@@ -1,0 +1,29 @@
+{
+  "rank": "genus",
+  "scale": "counts",
+  "zero_replacement_relative": 8.630476593396315e-07,
+  "n_features": 16049,
+  "n_samples": 252,
+  "n_samples_analyzed": 252,
+  "excluded_zero_total_sample_ids": [],
+  "tables": {
+    "sample_qc": "/project/3033006.01/Eefke/mscProject/mllabiome/examples/runs/Mindset-Simulation/explore/genus/tables/sample_qc.parquet",
+    "alpha_diversity": "/project/3033006.01/Eefke/mscProject/mllabiome/examples/runs/Mindset-Simulation/explore/genus/tables/alpha_diversity.parquet",
+    "alpha_statistics": "/project/3033006.01/Eefke/mscProject/mllabiome/examples/runs/Mindset-Simulation/explore/genus/tables/alpha_statistics.parquet",
+    "beta_statistics": "/project/3033006.01/Eefke/mscProject/mllabiome/examples/runs/Mindset-Simulation/explore/genus/tables/beta_statistics.parquet",
+    "taxon_summary": "/project/3033006.01/Eefke/mscProject/mllabiome/examples/runs/Mindset-Simulation/explore/genus/tables/taxon_summary.parquet"
+  },
+  "figures": {
+    "Alpha diversity": "/project/3033006.01/Eefke/mscProject/mllabiome/examples/runs/Mindset-Simulation/explore/genus/figures/alpha_diversity.svg",
+    "Aitchison PCoA": "/project/3033006.01/Eefke/mscProject/mllabiome/examples/runs/Mindset-Simulation/explore/genus/figures/aitchison_pcoa.svg",
+    "CLR abundance structure": "/project/3033006.01/Eefke/mscProject/mllabiome/examples/runs/Mindset-Simulation/explore/genus/figures/clr_heatmap.svg",
+    "Differential abundance and taxon associations": null
+  },
+  "differential_abundance": {
+    "method": "off",
+    "status": "disabled",
+    "model": "",
+    "multiple_testing": null,
+    "runtime": null
+  }
+}
