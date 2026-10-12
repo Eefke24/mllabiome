@@ -12,7 +12,7 @@ from xgboost import XGBClassifier
 from mllabiome import mll
 
 HERE = Path(__file__).resolve().parent
-TITLE = "Mindset Multi-Label Microbiome Sweep"
+TITLE = "Mindset Single-Label (Mood) Microbiome Sweep"
 EXPERIMENT_DIR = HERE / "runs" / "Mindset-Simulation"
 
 METADATA = mll.Metadata(
@@ -20,7 +20,7 @@ METADATA = mll.Metadata(
 )
 
 DATA = mll.Data(
-    abundance_path=HERE / "data" / "MINDset_simulation" / "mllabiome_simulation_data_exclusive.tsv",
+    abundance_path=HERE / "data" / "MINDset_simulation" / "mllabiome_simulation_data_with_signals.tsv",
     metadata=METADATA,
     format="metaphlan_tsv",
     sample_id_col="sampleID", 
@@ -35,7 +35,7 @@ DATA = mll.Data(
 
 # 3. EXPLORE CONFIGURATION
 EXPLORE = mll.Explore(
-    ranks=("family", "genus"), # Added family and genus as requested
+    ranks=("family", "genus"), 
     top_taxa=12,
     heatmap_top=30,
     min_prevalence=0.10,
@@ -145,9 +145,9 @@ MODELS = (
 
 EVALUATION = mll.Evaluation(
     optimize_metric="log_loss",
-    outer_folds=5,      
-    inner_folds=3,      
-    repeats=2,          
+    outer_folds=2,      
+    inner_folds=2,      
+    repeats=1,          
     n_jobs=8            
 )
 
