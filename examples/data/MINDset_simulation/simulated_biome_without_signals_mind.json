@@ -1,0 +1,8 @@
+{
+  "target": "MoodDisFinal",
+  "taxa": [],
+  "log_fold_change": 0.0,
+  "fold_change": 1.0,
+  "effect_interpretation": "categorical_level:Present",
+  "signal_level": "Present"
+}

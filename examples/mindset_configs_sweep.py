@@ -13,21 +13,21 @@ from mllabiome import mll
 
 HERE = Path(__file__).resolve().parent
 TITLE = "Mindset Single-Label (Mood) Microbiome Sweep"
-EXPERIMENT_DIR = HERE / "runs" / "Mindset-Simulation"
+EXPERIMENT_DIR = HERE / "runs" / "Mindset-Simulation2"
 
 METADATA = mll.Metadata(
-    metadata_path=HERE / "data" / "MINDset_simulation" / "mllabiome_metadata.tsv",
+    metadata_path=HERE / "data" / "MINDset_simulation" / "simulated_metadata_mind.tsv",
 )
 
 DATA = mll.Data(
-    abundance_path=HERE / "data" / "MINDset_simulation" / "mllabiome_simulation_data_with_signals.tsv",
+    abundance_path=HERE / "data" / "MINDset_simulation" / "simulated_biome_with_signals_mind.tsv",
     metadata=METADATA,
     format="metaphlan_tsv",
     sample_id_col="sampleID", 
-    target_col = "Mood",
+    target_col = "MoodDisFinal",
     task = "classification",
-    class_labels=("0", "1"),
-    positive_class="1",
+    class_labels=("Absent", "Present"),
+    positive_class="Present",
     subject_id_col="sampleID",
     # target_col=("Mood", "ASD", "ADHD", "Anxiety", "SUD"),
     # task="multilabel_classification", 
