@@ -6,31 +6,29 @@ matplotlib.use('Agg')
 
 from sklearn.ensemble import ExtraTreesClassifier, RandomForestClassifier
 from sklearn.multioutput import MultiOutputClassifier
-from sklearn.linear_model import RidgeClassifier
+from sklearn.linear_model import LogisticRegression, RidgeClassifier
 from xgboost import XGBClassifier
 
 from mllabiome import mll
 
 HERE = Path(__file__).resolve().parent
-TITLE = "Mindset Single-Label (Mood) Microbiome Sweep"
-EXPERIMENT_DIR = HERE / "runs" / "Mindset-Simulation2"
+TITLE = "Mindset Single-Label Microbiome Sweep Predicting ADHD (strong signal induced in 1 taxa per diagnoses)"
+EXPERIMENT_DIR = HERE / "runs" / "Mindset_simulation_strongsig_all_predictingADHD"
 
 METADATA = mll.Metadata(
-    metadata_path=HERE / "data" / "MINDset_simulation" / "simulated_metadata_mind.tsv",
+    metadata_path=HERE / "data" / "MINDset_simulation" / "simulated_metadata_no_signal.tsv",
 )
 
 DATA = mll.Data(
-    abundance_path=HERE / "data" / "MINDset_simulation" / "simulated_biome_with_signals_mind.tsv",
+    abundance_path=HERE / "data" / "MINDset_simulation" / "simulated_biome_strongsignal_all.tsv",
     metadata=METADATA,
     format="metaphlan_tsv",
-    sample_id_col="sampleID", 
-    target_col = "MoodDisFinal",
+    sample_id_col="Deelnemerscode", 
+    target_col = "ADHD_Final",
     task = "classification",
     class_labels=("Absent", "Present"),
     positive_class="Present",
-    subject_id_col="sampleID",
-    # target_col=("Mood", "ASD", "ADHD", "Anxiety", "SUD"),
-    # task="multilabel_classification", 
+    subject_id_col="Deelnemerscode",
 )
 
 # 3. EXPLORE CONFIGURATION
@@ -55,6 +53,7 @@ RESOLUTIONS = (
 
 COUNT_TRANSFORMATIONS = (
     mll.Transformation("relative_abundance", composition_scope="joint"),
+    mll.Transformation("hellinger", composition_scope="joint"),
     mll.Transformation("clr", composition_scope="joint"),
 )
 
@@ -97,45 +96,26 @@ MODELS = (
             random_state=42,
         )
     ),
+    (
+        "LogisticRegression_ElasticNet",
+        LogisticRegression(
+            penalty="elasticnet",
+            solver="saga",
+            l1_ratio=0.5,
+            C=1.0,
+            max_iter=5000,
+            random_state=42,
+        ),
+    ),
+    (
+        "LinearSVC_Calibrated",
+        mll.build_learner("calib_lsvc"),
+    ),
+    (
+        "RBF_SVC_Calibrated",
+        mll.build_learner("svc_rbf"),
+    ),
 )
-
-# (multi-label compatible)
-# MODELS = (
-#     (
-#         "RF_1000_msl5",
-#         RandomForestClassifier(
-#             n_estimators=1000,
-#             min_samples_leaf=5,
-#             n_jobs=1,
-#             random_state=42,
-#         ),
-#     ),
-#     (
-#         "ExtraTrees_1000_msl5",
-#         ExtraTreesClassifier(
-#             n_estimators=1000,
-#             min_samples_leaf=5,
-#             max_features="sqrt",
-#             n_jobs=1,
-#             random_state=42,
-#         ),
-#     ),
-#     (
-#         # Wrapping XGBoost to handle multi-label outputs natively
-#         "XGB_Multi_250_lr0.1",
-#         MultiOutputClassifier(
-#             XGBClassifier(
-#                 learning_rate=0.1,
-#                 n_estimators=250,
-#                 max_depth=3,
-#                 objective="binary:logistic",
-#                 eval_metric="logloss",
-#                 n_jobs=1,
-#                 random_state=42,
-#             )
-#         )
-#     ),
-# )
 
 
 # EVALUATION = mll.Evaluation.benchmark(
@@ -145,10 +125,10 @@ MODELS = (
 
 EVALUATION = mll.Evaluation(
     optimize_metric="log_loss",
-    outer_folds=2,      
-    inner_folds=2,      
-    repeats=1,          
-    n_jobs=8            
+    outer_folds=5,      
+    inner_folds=3,      
+    repeats=2,          
+    n_jobs=2            
 )
 
 
@@ -158,30 +138,41 @@ GATE = mll.QualificationGate(
 
 
 ENSEMBLE = mll.Ensemble(
-    max_sizes=(3,),
+    include_inactive=True,
+    max_sizes=(3, 5, 10,),
     selection_strategies=(
         "top_k",
-        #"best_per_resolution",
-        #"best_per_learner_type",
+        "best_per_resolution",
+        "best_per_learner_type",
+        "performance_diversity",
+        "caruana",
+        "bagged_caruana",
+        "super_learner",
+        "safe_super_learner",
     ),
     aggregation_strategies=(
         "mean_proba",
-        #"weighted_mean_proba",
+        "weighted_mean_proba",
+        "median_proba",
+        "logistic_stacking",
+        "rf_stacking",
     ),
     optimize_metric="log_loss",
 )
 
 EXPLAINABILITY = mll.Explainability(
-    targets=("mpma_b","mpma_e"),
+    targets=("mpma_b",),
     profile="screening",
     methods=(
         mll.Permutation(),
+        mll.ALE(),
+        mll.LIME(),
     ),
     classes="auto",
 )
 
 ROBUSTNESS = mll.Robustness(
-    targets=("mpma_b","mpma_e"),
+    targets=("mpma_b",),
     top_k=30,
 )
 

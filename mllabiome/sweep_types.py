@@ -522,6 +522,10 @@ def _validate_sweep_configuration(sweep: Any) -> None:
     if source is None:
         raise ValueError("Sweep requires a data or samples specification.")
     task = _normalise_sweep_task(source.task)
+    # Multi-label data is evaluated as one binary classification sweep per
+    # target, so validate the shared configuration with classification rules.
+    if task == "multilabel":
+        task = "classification"
     protocol = str(sweep.evaluation.protocol)
     n_classes = _configured_class_count(source) if task == "classification" else None
     sweep.evaluation.optimize_metric = _validate_metric(
