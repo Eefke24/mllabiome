@@ -7,6 +7,13 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+from sklearn.metrics import (
+    accuracy_score,
+    average_precision_score,
+    f1_score,
+    hamming_loss,
+    roc_auc_score,
+)
 
 from . import report as _report
 from ._evaluation_protocols import is_lodo_protocol
@@ -1670,6 +1677,81 @@ def _multilabel_summary(children: list[Sweep]) -> pd.DataFrame:
     return macro
 
 
+def _multilabel_oof_summary(children: list[Sweep], report_dir: Path) -> tuple[pd.DataFrame, Path | None]:
+    """Compute joint metrics from each label's held-out predictions."""
+    truth: dict[str, pd.Series] = {}
+    scores: dict[str, pd.Series] = {}
+    per_label: list[dict[str, Any]] = []
+    for child in children:
+        target = str(child.data.target_col)
+        frame = _read_table(Path(child.root()) / "predictions" / "mpma_b_outer_predictions.parquet")
+        if frame.empty or not {"outer_split_key", "sample_id", "y_true"}.issubset(frame.columns):
+            continue
+        if "y_proba_pos" in frame.columns:
+            probability = pd.to_numeric(frame["y_proba_pos"], errors="coerce")
+        else:
+            positive_label = str(child.data.positive_class)
+            col = f"proba_{positive_label}"
+            if col not in frame.columns:
+                continue
+            probability = pd.to_numeric(frame[col], errors="coerce")
+        keys = frame["outer_split_key"].astype(str) + "\0" + frame["sample_id"].astype(str)
+        y = pd.to_numeric(frame["y_true"], errors="coerce")
+        valid = y.notna() & probability.notna()
+        series_key = pd.Index(keys[valid], name="prediction_unit")
+        truth[target] = pd.Series(y[valid].to_numpy(dtype=int), index=series_key)
+        scores[target] = pd.Series(probability[valid].to_numpy(dtype=float), index=series_key)
+        yt = truth[target].to_numpy(dtype=int)
+        auc = roc_auc_score(yt, scores[target]) if len(np.unique(yt)) == 2 else np.nan
+        ap = average_precision_score(yt, scores[target]) if len(np.unique(yt)) == 2 else np.nan
+        per_label.append({"Target": target, "AUROC": auc, "Average precision": ap})
+    if not truth:
+        return pd.DataFrame(), None
+
+    y_true = pd.concat(truth, axis=1).sort_index()
+    y_score = pd.concat(scores, axis=1).reindex(index=y_true.index, columns=y_true.columns)
+    known = y_true.notna()
+    flat_true = y_true.to_numpy(dtype=float)[known.to_numpy()].astype(int)
+    flat_score = y_score.to_numpy(dtype=float)[known.to_numpy()]
+    flat_pred = (flat_score >= 0.5).astype(int)
+    fully_known = known.all(axis=1).to_numpy()
+    exact_match = (
+        accuracy_score(y_true.loc[fully_known].to_numpy(dtype=int),
+                       (y_score.loc[fully_known].to_numpy(dtype=float) >= 0.5).astype(int))
+        if fully_known.any() else np.nan
+    )
+    auc_micro = roc_auc_score(flat_true, flat_score) if len(np.unique(flat_true)) == 2 else np.nan
+    ap_micro = average_precision_score(flat_true, flat_score) if len(np.unique(flat_true)) == 2 else np.nan
+    label_frame = pd.DataFrame(per_label)
+    metrics = pd.DataFrame([{
+        "Summary": "Joint held-out predictions (MPMA-B)",
+        "AUROC micro": auc_micro,
+        "AUROC macro": label_frame["AUROC"].mean(),
+        "Average precision micro": ap_micro,
+        "Average precision macro": label_frame["Average precision"].mean(),
+        "F1 micro": f1_score(flat_true, flat_pred, zero_division=0),
+        "F1 macro": f1_score(flat_true, flat_pred, average="macro", zero_division=0),
+        "Hamming loss": hamming_loss(flat_true, flat_pred),
+        "Exact match": exact_match,
+        "Observed label predictions": int(known.to_numpy().sum()),
+        "Fully observed prediction rows": int(fully_known.sum()),
+    }])
+    figure_path = report_dir / "figures" / "multilabel_performance.png"
+    figure_path.parent.mkdir(parents=True, exist_ok=True)
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    plot_data = label_frame.set_index("Target")[["AUROC", "Average precision"]]
+    ax = plot_data.plot(kind="bar", figsize=(9, 4.5), ylim=(0, 1), rot=30)
+    ax.set_ylabel("Score")
+    ax.set_title("Per-diagnosis held-out discrimination (MPMA-B)")
+    ax.legend(loc="lower right")
+    ax.figure.tight_layout()
+    ax.figure.savefig(figure_path, dpi=160)
+    plt.close(ax.figure)
+    return metrics, figure_path
+
+
 def write_multi_target_report(
     sweep: Sweep, children: list[Sweep] | None = None
 ) -> dict[str, Path]:
@@ -1699,6 +1781,10 @@ def write_multi_target_report(
 
         macro = (
             _multilabel_summary(children) if task == "multilabel" else pd.DataFrame()
+        )
+        joint_metrics, joint_figure = (
+            _multilabel_oof_summary(children, report_dir)
+            if task == "multilabel" else (pd.DataFrame(), None)
         )
 
         procedure = pd.DataFrame(
@@ -1744,6 +1830,7 @@ def write_multi_target_report(
 <body>{_report._report_nav_html()}
 <div class="report-shell"><main id="top" class="report-content"><h2 id="performance-evaluation" class="first-section">Task definition and evaluation procedure</h2>{_report._procedure_grid_html(procedure)}
 <h2 id="performance-summary">Target performance overview</h2><p>Every target retains its task-appropriate primary metric. Values are mean ± SD across {"held-out datasets" if is_lodo_protocol(sweep.evaluation.protocol) else "outer test folds"}. Classification and regression metrics are intentionally not collapsed into a single heterogeneous score.</p>{_report._html_table(overview)}{_report._html_table(macro) if not macro.empty else ""}
+{f'<h2>Joint multi-label performance</h2><p>Metrics use aligned held-out MPMA-B predictions. Missing diagnosis labels are omitted from cell-wise metrics; exact match is calculated only for rows with every diagnosis observed.</p>{_report._html_table(joint_metrics)}<img alt="Per-diagnosis held-out performance" style="max-width:100%;height:auto" src="report/figures/{joint_figure.name}">' if not joint_metrics.empty and joint_figure else ''}
 {sections}{_report._report_footer_html()}</main></div></body></html>'''
 
     html_text = _report._sanitize_report_html(html_text)
@@ -1843,6 +1930,8 @@ def write_multi_target_report(
 
     if not macro.empty:
         _report._terminal_table("Macro target summary", macro)
+    if not joint_metrics.empty:
+        _report._terminal_table("Joint multi-label performance", joint_metrics)
 
     for child in children:
         child_root = Path(child.root())

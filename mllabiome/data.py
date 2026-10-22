@@ -123,6 +123,7 @@ class Data:
     positive_class: int | str = 1
     target_class_labels: Mapping[str, tuple[str, ...]] | None = None
     target_positive_classes: Mapping[str, int | str] | None = None
+    drop_missing_target: bool = False
 
     def __post_init__(self) -> None:
         if self.metadata is not None and not isinstance(self.metadata, Metadata):
@@ -295,6 +296,13 @@ def _is_missing(value: Any) -> bool:
         return bool(pd.isna(value))
     except (TypeError, ValueError):
         return False
+
+
+def _target_missing_mask(values: pd.Series) -> pd.Series:
+    return values.map(
+        lambda value: _is_missing(value)
+        or (isinstance(value, str) and not value.strip())
+    )
 
 
 def _normalise_text(value: Any) -> str:
@@ -657,6 +665,10 @@ def _load_csv_dataset(spec: Data, levels_needed: tuple[str, ...]) -> Dataset:
     target_col = _single_target_name(spec)
     if target_col not in df.columns:
         raise ValueError(f"Target column {target_col!r} not found.")
+    if spec.drop_missing_target:
+        df = df.loc[~_target_missing_mask(df[target_col])].copy()
+        if df.empty:
+            raise ValueError(f"Target column {target_col!r} has no observed labels.")
     if spec.sample_id_col in df.columns:
         sample_series = df[spec.sample_id_col].astype(str)
         if sample_series.duplicated().any():
@@ -796,6 +808,10 @@ def _load_matrix_tsv_dataset(spec: Data, levels_needed: tuple[str, ...]) -> Data
     target_col = _single_target_name(spec)
     if target_col not in meta.columns:
         raise ValueError(f"Metadata missing target column {target_col!r}.")
+    if spec.drop_missing_target:
+        meta = meta.loc[~_target_missing_mask(meta[target_col])].copy()
+        if meta.empty:
+            raise ValueError(f"Target column {target_col!r} has no observed labels.")
     meta[spec.sample_id_col] = meta[spec.sample_id_col].astype(str).str.strip()
     if meta[spec.sample_id_col].duplicated().any():
         duplicates = meta.loc[

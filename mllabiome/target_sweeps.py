@@ -86,6 +86,7 @@ def _explainability_for_target(
 
 def target_sweeps(sweep: Sweep) -> list[Sweep]:
     targets = _target_columns(sweep.data)
+    is_multilabel = _normalise_sweep_task(sweep.data.task) == "multilabel"
     if len(targets) == 1 and _normalise_sweep_task(sweep.data.task) not in {
         "multilabel",
         "multioutput",
@@ -115,6 +116,7 @@ def target_sweeps(sweep: Sweep) -> list[Sweep]:
             class_labels=labels,
             positive_class=positive,
             metadata_cols=extra_metadata,
+            drop_missing_target=is_multilabel,
         )
         default_metric = "RMSE" if task == "regression" else "log_loss"
         child_evaluation = replace(

@@ -5,21 +5,21 @@ import matplotlib
 matplotlib.use('Agg')
 
 from sklearn.ensemble import ExtraTreesClassifier, RandomForestClassifier
-from sklearn.linear_model import RidgeClassifier
+from sklearn.linear_model import LogisticRegression, RidgeClassifier
 from xgboost import XGBClassifier
 
 from mllabiome import mll
 
 HERE = Path(__file__).resolve().parent
-TITLE = "Mindset First Try Multi-Label Microbiome Sweep, with strong signal in 1 taxa for each diagnoses"
-EXPERIMENT_DIR = HERE / "runs" / "Mindset_multilabel_1"
+TITLE = "Mindset independent multi-label microbiome sweep"
+EXPERIMENT_DIR = HERE / "runs" / "Mindset-multilabel-independent-targets"
 
 METADATA = mll.Metadata(
     metadata_path=HERE / "data" / "MINDset_simulation" / "simulated_metadata_no_signal.tsv",
 )
 
 DATA = mll.Data(
-    abundance_path=HERE / "data" / "MINDset_simulation" / "simulatied_biome_strongsignal_all.tsv",
+    abundance_path=HERE / "data" / "MINDset_simulation" / "simulated_biome_strongsignal_all.tsv",
     metadata=METADATA,
     format="metaphlan_tsv", 
     sample_id_col="Deelnemerscode",
