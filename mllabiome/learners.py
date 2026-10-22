@@ -111,7 +111,18 @@ _LEARNER_DISPLAY_NAMES = {
     "QuadraticDiscriminantAnalysis": "Quadratic discriminant analysis",
     "SGDClassifier": "Stochastic gradient descent",
     "FLAMLClassifier": "FLAML",
+    "CausiloClassifier": "Causilo",
+    "EXAONETabularClassifier": "EXAONE Tabular",
+    "KumoTabularClassifier": "Kumo Tabular",
+    "KumoTabularRegressor": "Kumo Tabular",
+    "LimiXClassifier": "LimiX",
+    "LimiX2Classifier": "LimiX-2",
+    "TabDPTClassifier": "TabDPT",
     "TabPFNClassifier": "TabPFN",
+    "TabICLClassifier": "TabICLv2",
+    "TabFMClassifier": "TabFM",
+    "TabMClassifier": "TabM-D",
+    "RealMLPClassifier": "RealMLP-TD",
     "XGBClassifier": "XGBoost",
     "XGBRegressor": "XGBoost",
     "LGBMClassifier": "LightGBM",
@@ -622,6 +633,12 @@ def _prepare_group_cv_estimator(
     nested_under_cv: bool = False,
     allow_pipeline: bool = True,
 ) -> None:
+    if isinstance(estimator, GroupAwareCalibratedClassifier):
+        from .siamcat import SIAMCATClassifier
+
+        if isinstance(estimator.estimator, SIAMCATClassifier):
+            estimator._splits(X, y, groups)
+            return
     if _hidden_internal_cv(estimator):
         if isinstance(estimator, SVC):
             raise ValueError(

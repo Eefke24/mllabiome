@@ -24,6 +24,8 @@ from .configs_sweep import (
     evaluate,
 )
 from .data import Data, Dataset, Metadata, load_dataset
+from .causilo import CausiloClassifier, CausiloDependencyError
+from .exaone import EXAONETabularClassifier, EXAONETabularDependencyError
 from .ensemble_sweep import sweep_ensemble
 from .explainability import (
     ExplainabilityConfigurationError,
@@ -31,11 +33,14 @@ from .explainability import (
 )
 from .explainability_methods import ALE, LIME, SHAP, ALEInteractions, Permutation
 from .final_explainability import explain
+from .federated import Federated
 from .foundation_models import (
     MBEMBED_REFERENCE,
     MGM2_REFERENCE,
     MGM_REFERENCE,
     WAYPOINT_REFERENCE,
+    QWEN3_EMBEDDING_REFERENCE,
+    QwenOllamaEmbedding,
     FoundationModelDependencyError,
     FoundationModelReference,
     MBEmbed,
@@ -45,7 +50,14 @@ from .foundation_models import (
     foundation_model_references,
 )
 from .integrations import IntegratedCoordinate, Integration, IntegrationModel
+from .kumo import KumoTabularClassifier, KumoTabularDependencyError
+from .kumo_regressor import KumoTabularRegressor
+from .limix2 import LimiX2Classifier, LimiX2DependencyError
+from .limix import LimiXClassifier
 from .learners import FLAMLClassifier, build_learner, validate_model_specs
+from .ollama_decision import OllamaDecisionClassifier
+from .ridge_softmax import RidgeSoftmaxClassifier
+from .rank_calibration import GroupedRankCalibratedClassifier
 from .metrics import compute_metrics, compute_regression_metrics
 from .modalities import (
     Modality,
@@ -58,6 +70,11 @@ from .pipeline import run_all, run_explore, run_inference, run_robustness
 from .report import write_report
 from .resolutions import materialize_mpdr
 from .siamcat import SIAMCATClassifier
+from .tabdpt import TabDPTClassifier, TabDPTDependencyError
+from .tabicl import TabICLClassifier, TabICLDependencyError
+from .tabfm import TabFMClassifier, TabFMDependencyError
+from .tabm import TabMClassifier, TabMDependencyError
+from .realmlp import RealMLPClassifier, RealMLPDependencyError
 from .tabpfn import TabPFNClassifier, TabPFNDependencyError
 from .transformations import (
     TRANSFORMATION_LABELS,
@@ -65,6 +82,7 @@ from .transformations import (
     CountTransformation,
     CountTransformationAdapter,
     PrevalenceFilter,
+    ScopedTransformation,
     Transform,
     Transformation,
     TransformationCoordinate,
@@ -83,7 +101,17 @@ from .utils import (
 __all__ = [
     "ALE",
     "CLASSIFICATION_METRIC_COLUMNS",
+    "CausiloClassifier",
+    "CausiloDependencyError",
+    "EXAONETabularClassifier",
+    "EXAONETabularDependencyError",
+    "KumoTabularClassifier",
+    "KumoTabularRegressor",
+    "KumoTabularDependencyError",
     "LIME",
+    "LimiXClassifier",
+    "LimiX2Classifier",
+    "LimiX2DependencyError",
     "METRIC_COLUMNS",
     "MPDR",
     "MPMA",
@@ -98,6 +126,7 @@ __all__ = [
     "Dataset",
     "Ensemble",
     "Evaluation",
+    "Federated",
     "Explore",
     "Explainability",
     "ExplainabilityConfigurationError",
@@ -122,9 +151,23 @@ __all__ = [
     "ModalityMatrix",
     "Permutation",
     "PrevalenceFilter",
+    "ScopedTransformation",
     "QualificationGate",
     "Robustness",
+    "OllamaDecisionClassifier",
+    "RidgeSoftmaxClassifier",
+    "GroupedRankCalibratedClassifier",
     "SIAMCATClassifier",
+    "TabFMClassifier",
+    "TabFMDependencyError",
+    "TabMClassifier",
+    "TabMDependencyError",
+    "TabICLClassifier",
+    "TabICLDependencyError",
+    "RealMLPClassifier",
+    "RealMLPDependencyError",
+    "TabDPTClassifier",
+    "TabDPTDependencyError",
     "TabPFNClassifier",
     "TabPFNDependencyError",
     "Samples",
@@ -135,6 +178,8 @@ __all__ = [
     "TransformationCoordinate",
     "TransformationLabel",
     "WAYPOINT_REFERENCE",
+    "QWEN3_EMBEDDING_REFERENCE",
+    "QwenOllamaEmbedding",
     "WaypointEmbedding",
     "build_count_transformations",
     "build_learner",

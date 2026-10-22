@@ -269,7 +269,7 @@ def _ensemble_configs(
 
 def _eligible_config_ids(configs: pd.DataFrame, plan: Ensemble) -> set[str]:
     frame = configs.copy()
-    if "active" in frame.columns and not bool(getattr(plan, "include_inactive", False)):
+    if "active" in frame.columns and not bool(getattr(plan, "include_inactive", True)):
         frame = frame[
             pd.to_numeric(frame["active"], errors="coerce").fillna(0).astype(int).eq(1)
         ]
@@ -1005,6 +1005,9 @@ def _apply_candidate(
 
 
 def sweep_regression_ensemble(sweep: Sweep) -> dict[str, Path]:
+    from ._config_store import refresh_catalog
+
+    refresh_catalog(Path(sweep.root()))
     root = Path(sweep.root())
     ensemble_dir = root / "ensembling"
     ensemble_dir.mkdir(parents=True, exist_ok=True)

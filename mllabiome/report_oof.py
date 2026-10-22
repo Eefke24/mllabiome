@@ -1439,6 +1439,9 @@ def _human_token(value: Any) -> str:
 def _mpma_b_composition(
     root: Path, learner_labels: dict[str, str] | None = None
 ) -> pd.DataFrame:
+
+    if not (root / "final_models.json").exists():
+        return pd.DataFrame()
     final = load_final_models(root)["MPMA-B"]
     representation = final.get("resolution", final.get("levels", ""))
     return pd.DataFrame(
@@ -1812,8 +1815,7 @@ def enhance_html_report(
     if footer_pos == -1:
         body_close = text.rfind("</body>")
         footer_pos = body_close if body_close != -1 else len(text)
-    abbreviations_pos = text.find('<h2 id="abbreviations">')
-    compute_pos = abbreviations_pos if abbreviations_pos != -1 else footer_pos
+    compute_pos = footer_pos
     if compute_block:
         text = text[:compute_pos] + compute_block + "\n" + text[compute_pos:]
     text = text.replace("Learner family", "Learner type")

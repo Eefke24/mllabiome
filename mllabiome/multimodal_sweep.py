@@ -1,13 +1,11 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from multiprocessing import Manager
 from pathlib import Path
-from queue import Empty
-from threading import Event, Thread
 from typing import Any, TypeAlias
 
 import numpy as np
@@ -17,7 +15,7 @@ from threadpoolctl import threadpool_limits
 
 from ._evaluation_protocols import is_lodo_protocol
 from ._version import __version__
-from .compute import ResourceTracker, machine_profile
+from .compute import ResourceTracker, machine_profile, synchronize_accelerators
 from .configs_sweep import (
     MPDR,
     QualificationGate,
@@ -54,10 +52,21 @@ from .configs_sweep import (
     _validate_experiment_identity,
     _write_config_table,
     _write_rankings_and_figures,
-    _write_tables,
+    _publish_completed_config,
+    _checkpoint_inner,
+    _recover_committed_configs,
     write_mpma_b_selection_outputs,
 )
-from .console import path_table, progress, stage, success, summary_table
+from .console import (
+    EvaluationMonitor,
+    evaluation_leaders,
+    path_table,
+    stage,
+    success,
+    summary_table,
+    info,
+)
+from ._config_store import latest_ranked_config, refresh_catalog, top_configs
 from .estimator_protocol import EstimatorLike
 from .figures import _write_representation_impact_figure
 from .integrations import Integration
@@ -65,6 +74,7 @@ from .integrations import IntegrationModel as IntegrationModel
 from .integrations import integration_modality_sets as integration_modality_sets
 from .learners import fit_classifier
 from .metrics import (
+    metric_is_loss,
     _estimator_call,
     aggregate_validation_metric,
     canonical_metric_name,
@@ -148,6 +158,7 @@ class _ModalityEvaluationRows:
     inner_predictions: list[dict[str, Any]]
     qualification: list[dict[str, Any]]
     job_resources: list[dict[str, Any]]
+    latest_config_id: str | None = None
 
     @classmethod
     def empty(cls) -> _ModalityEvaluationRows:
@@ -247,6 +258,7 @@ def _fit_classification_candidate_fold(
     random_state: int,
     threads_per_worker: int,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, float]]:
+    fold_start = time.perf_counter_ns()
     X_train, X_eval, _ = _prepare_candidate_pair(
         spec,
         matrices,
@@ -258,14 +270,22 @@ def _fit_classification_candidate_fold(
         _count_transformation_factory,
         _lodo_feature_pair,
     )
+    prep_end = time.perf_counter_ns()
     estimator = configure_estimator_threads(learner_factory(), threads_per_worker)
+    setup_end = time.perf_counter_ns()
+    synchronize_accelerators()
+    fit_start = time.perf_counter_ns()
     fit_classifier(
         estimator,
         X_train,
         y[train_idx],
         None if groups is None else groups[train_idx],
     )
+    synchronize_accelerators()
+    fit_end = time.perf_counter_ns()
     proba = _predict_proba_aligned(estimator, X_eval, classes)
+    synchronize_accelerators()
+    predict_end = time.perf_counter_ns()
     pred = classes[proba.argmax(axis=1)]
     metrics = compute_metrics(y[eval_idx], pred, proba, classes)
     if "subject_macro_log_loss" in requested_metrics:
@@ -277,6 +297,21 @@ def _fit_classification_candidate_fold(
         )
     if "cohort_macro_log_loss" in requested_metrics and is_lodo_protocol(protocol):
         metrics["cohort_macro_log_loss"] = float(metrics["log_loss"])
+    score_end = time.perf_counter_ns()
+    metrics.update(
+        {
+            "preprocess_seconds": (prep_end - fold_start) / 1e9,
+            "model_setup_seconds": (setup_end - prep_end) / 1e9,
+            "fit_seconds": (fit_end - fit_start) / 1e9,
+            "predict_seconds": (predict_end - fit_end) / 1e9,
+            "score_seconds": (score_end - predict_end) / 1e9,
+            "fold_wall_seconds": (score_end - fold_start) / 1e9,
+            "n_train": int(len(train_idx)),
+            "n_test": int(len(eval_idx)),
+            "n_features": int(X_train.shape[1]),
+            "threads_per_worker": int(threads_per_worker),
+        }
+    )
     return np.asarray(pred), np.asarray(proba), metrics
 
 
@@ -383,6 +418,7 @@ def _evaluate_classification_inner_folds(
     progress_queue: Any,
     completed_steps: int,
     total_steps: int,
+    checkpoint_root: str | None = None,
 ) -> int:
     for inner_no, (train_local, validation_local) in enumerate(inner_splits):
         inner_key = f"{split_key}__i{inner_no}"
@@ -439,21 +475,28 @@ def _evaluate_classification_inner_folds(
                 subject_ids,
             )
             result["inner_metrics"].append(row)
-            result["inner_predictions"].extend(
-                _classification_prediction_rows(
-                    spec,
-                    inner_key,
-                    split_key,
-                    "inner",
-                    validation_idx,
-                    sample_ids,
-                    subject_ids,
-                    y,
-                    class_labels,
-                    pred,
-                    proba,
-                )
+            prediction_rows = _classification_prediction_rows(
+                spec,
+                inner_key,
+                split_key,
+                "inner",
+                validation_idx,
+                sample_ids,
+                subject_ids,
+                y,
+                class_labels,
+                pred,
+                proba,
             )
+            result["inner_predictions"].extend(prediction_rows)
+            if checkpoint_root is not None:
+                _checkpoint_inner(
+                    Path(checkpoint_root),
+                    spec.config_id,
+                    inner_key,
+                    row,
+                    prediction_rows,
+                )
             if np.isfinite(float(metrics.get(gate_metric, np.nan))):
                 score_rows.append(dict(row))
             result["fits"] += 1
@@ -653,6 +696,7 @@ def _classification_task(
     threads_per_worker: int,
     resource_sample_interval_s: float,
     progress_queue: Any = None,
+    checkpoint_root: str | None = None,
 ) -> dict[str, Any]:
     tracker = ResourceTracker(sample_interval_s=resource_sample_interval_s).start()
     mpdr = MPDR(
@@ -712,6 +756,7 @@ def _classification_task(
             progress_queue,
             completed_steps,
             total_steps,
+            checkpoint_root=checkpoint_root,
         )
         qualified = _classification_qualification(
             spec,
@@ -793,6 +838,7 @@ def _fit_regression_candidate_fold(
     random_state: int,
     threads_per_worker: int,
 ) -> tuple[np.ndarray, dict[str, float]]:
+    fold_start = time.perf_counter_ns()
     X_train, X_eval, _ = _prepare_candidate_pair(
         spec,
         matrices,
@@ -804,10 +850,34 @@ def _fit_regression_candidate_fold(
         _count_transformation_factory,
         _lodo_feature_pair,
     )
+    prep_end = time.perf_counter_ns()
     estimator = configure_estimator_threads(learner_factory(), threads_per_worker)
+    setup_end = time.perf_counter_ns()
+    synchronize_accelerators()
+    fit_start = time.perf_counter_ns()
     estimator.fit(X_train, y[train_idx])
+    synchronize_accelerators()
+    fit_end = time.perf_counter_ns()
     pred = np.asarray(_estimator_call(estimator, "predict", X_eval), dtype=float)
-    return pred, compute_regression_metrics(y[eval_idx], pred)
+    synchronize_accelerators()
+    predict_end = time.perf_counter_ns()
+    metrics = compute_regression_metrics(y[eval_idx], pred)
+    score_end = time.perf_counter_ns()
+    metrics.update(
+        {
+            "preprocess_seconds": (prep_end - fold_start) / 1e9,
+            "model_setup_seconds": (setup_end - prep_end) / 1e9,
+            "fit_seconds": (fit_end - fit_start) / 1e9,
+            "predict_seconds": (predict_end - fit_end) / 1e9,
+            "score_seconds": (score_end - predict_end) / 1e9,
+            "fold_wall_seconds": (score_end - fold_start) / 1e9,
+            "n_train": int(len(train_idx)),
+            "n_test": int(len(eval_idx)),
+            "n_features": int(X_train.shape[1]),
+            "threads_per_worker": int(threads_per_worker),
+        }
+    )
+    return pred, metrics
 
 
 def _regression_success_row(
@@ -882,6 +952,7 @@ def _evaluate_regression_inner_folds(
     progress_queue: Any,
     completed_steps: int,
     total_steps: int,
+    checkpoint_root: str | None = None,
 ) -> int:
     y = np.asarray(dataset.y, dtype=float)
     for inner_no, (train_local, validation_local) in enumerate(inner_splits):
@@ -916,20 +987,27 @@ def _evaluate_regression_inner_folds(
                 spec, mpdr, metrics, split_key, inner_key, "inner"
             )
             result["inner_metrics"].append(row)
-            result["inner_predictions"].extend(
-                _regression_prediction_rows(
-                    inner_key,
-                    spec.config_id,
-                    validation_idx,
-                    dataset.sample_ids,
-                    dataset.subject_ids,
-                    y,
-                    pred,
-                    "inner",
-                    split_key,
-                    dataset.target_name,
-                )
+            prediction_rows = _regression_prediction_rows(
+                inner_key,
+                spec.config_id,
+                validation_idx,
+                dataset.sample_ids,
+                dataset.subject_ids,
+                y,
+                pred,
+                "inner",
+                split_key,
+                dataset.target_name,
             )
+            result["inner_predictions"].extend(prediction_rows)
+            if checkpoint_root is not None:
+                _checkpoint_inner(
+                    Path(checkpoint_root),
+                    spec.config_id,
+                    inner_key,
+                    row,
+                    prediction_rows,
+                )
             if np.isfinite(float(metrics.get(gate_metric, np.nan))):
                 score_rows.append(dict(row))
             result["fits"] += 1
@@ -1039,6 +1117,7 @@ def _regression_task(
     threads_per_worker: int,
     resource_sample_interval_s: float,
     progress_queue: Any = None,
+    checkpoint_root: str | None = None,
 ) -> dict[str, Any]:
     tracker = ResourceTracker(sample_interval_s=resource_sample_interval_s).start()
     mpdr = MPDR(
@@ -1089,6 +1168,7 @@ def _regression_task(
             progress_queue,
             completed_steps,
             total_steps,
+            checkpoint_root=checkpoint_root,
         )
         qualified = _regression_qualification(
             gate, gate_metric, score_rows, existing_qualification
@@ -1190,17 +1270,15 @@ def _prepare_modality_sweep_context(sweep: Sweep) -> _ModalitySweepContext:
     )
     evaluation_fingerprint = _scientific_digest(
         {
-            "schema": "multimodal-evaluation-fingerprint-v3",
-            "source_tree_sha256": _source_tree_sha256(),
-            "package_version": __version__,
-            "model_runtime_dependencies": _software_provenance()["dependencies"],
+            "schema": "multimodal-benchmark-fingerprint-v1",
             "dataset_fingerprint": dataset_hash,
             "modality_fingerprints": modality_hashes,
-            "config_ids": sorted(configs["config_id"].astype(str).tolist()),
             "task": dataset.task,
             "target": dataset.target_name,
             "evaluation": {
                 "protocol": str(plan.protocol),
+                "inner_grouping": str(plan.inner_grouping),
+                "split_manifest": _scientific_value(plan.split_manifest),
                 "outer_folds": int(plan.outer_folds),
                 "inner_folds": int(plan.inner_folds),
                 "repeats": int(plan.repeats),
@@ -1251,7 +1329,10 @@ def _prepare_modality_sweep_context(sweep: Sweep) -> _ModalitySweepContext:
         "modality_fingerprints": modality_hashes,
         "source_file_sha256": source_hashes,
         "evaluation_fingerprint": evaluation_fingerprint,
-        "evaluation_fingerprint_algorithm": "sha256-scientific-multimodal-evaluation-v3",
+        "evaluation_cache_fingerprint": evaluation_fingerprint,
+        "selection_metric": str(plan.optimize_metric),
+        "gate_enabled": bool(sweep.gate.enabled),
+        "evaluation_fingerprint_algorithm": "sha256-multimodal-benchmark-v1",
         "experiment_fingerprint": _experiment_fingerprint(
             sweep, evaluation_fingerprint
         ),
@@ -1291,7 +1372,19 @@ def _prepare_modality_sweep_context(sweep: Sweep) -> _ModalitySweepContext:
         samples.stratify_col,
         samples.group_col,
     )
+    imported, rejected = refresh_catalog(root)
+    if imported or rejected:
+        info(f"Configuration catalog · {imported} indexed · {rejected} incompatible")
     current_ids = set(configs["config_id"].astype(str))
+    if not sweep.evaluation.redo:
+        _recover_committed_configs(
+            root,
+            current_ids,
+            outer_splits,
+            inner_splits_by_outer,
+            str(sweep.evaluation.optimize_metric),
+            bool(sweep.gate.enabled),
+        )
     outer_keys = {str(split["split_key"]) for split in outer_splits}
     existing = _load_existing_evaluation(
         root, current_ids, outer_keys, redo=sweep.evaluation.redo
@@ -1472,44 +1565,6 @@ def _show_modality_sweep_overview(
     )
 
 
-def _monitor_modality_progress(
-    progress_queue: Any,
-    stop_event: Event,
-    prog: Any,
-    split_tasks: Mapping[str, Any],
-    split_counts: Mapping[str, int],
-    completed_by_split: Mapping[str, int],
-    spec_lookup: Mapping[str, CandidateSpec],
-    candidate_order: Mapping[str, int],
-    candidate_count: int,
-) -> None:
-    while not stop_event.is_set():
-        try:
-            (
-                split_key,
-                config_id,
-                phase,
-                step_done,
-                step_total,
-                detail,
-            ) = progress_queue.get(timeout=0.25)
-        except Empty:
-            continue
-        split_key = str(split_key)
-        config_id = str(config_id)
-        spec = spec_lookup.get(config_id)
-        if spec is None or split_key not in split_tasks:
-            continue
-        ordinal = candidate_order.get(config_id, 0)
-        done_jobs = completed_by_split.get(split_key, 0)
-        description = (
-            f"{split_key} · {done_jobs}/{split_counts.get(split_key, 0)} jobs · "
-            f"candidate {ordinal}/{candidate_count} · {spec.integration.key} · "
-            f"{spec.learner} · {phase} {int(step_done)}/{int(step_total)} · {detail}"
-        )
-        prog.update(split_tasks[split_key], description=description)
-
-
 def _run_modality_tasks(
     context: _ModalitySweepContext,
     tasks: Sequence[_PreparedModalityTask],
@@ -1519,101 +1574,83 @@ def _run_modality_tasks(
     rows = _ModalityEvaluationRows.empty()
     if not tasks:
         return rows
-    spec_lookup = {spec.config_id: spec for spec in context.specs}
-    candidate_order = {
-        spec.config_id: index + 1 for index, spec in enumerate(context.specs)
+    expected_outer = {str(split["split_key"]) for split in context.outer_splits}
+    expected_inner = {
+        f"{str(split['split_key'])}__i{i}"
+        for split in context.outer_splits
+        for i in range(len(context.inner_splits_by_outer[str(split["split_key"])]))
     }
-    completed_by_split = {str(key): 0 for key in split_counts}
+    remaining = {}
+    for task in tasks:
+        remaining[task.config_id] = remaining.get(task.config_id, 0) + 1
+    manifest = json.loads((context.root / "manifest.json").read_text(encoding="utf-8"))
+    selection_metric = canonical_metric_name(
+        str(manifest.get("selection_metric", "log_loss"))
+    )
     completed_jobs = 0
     completed_fits = 0
     failed_fits = 0
-    stop_monitor = Event()
-    with Manager() as manager:
-        progress_queue = manager.Queue()
-        with progress() as prog:
-            overall_task = prog.add_task(
-                f"Evaluation · {execution.workers} workers · 0 fits · 0 failures",
-                total=len(tasks),
-            )
-            split_tasks = {
-                str(split_key): prog.add_task(
-                    f"{split_key} · queued · 0/{count} jobs",
-                    total=max(1, int(count)),
+    current_ids = set(context.configs["config_id"].astype(str))
+    completed_pairs = {
+        (str(split["split_key"]), str(config_id))
+        for split in context.outer_splits
+        for config_id in current_ids
+        if _outer_pair_complete(
+            str(split["split_key"]),
+            str(config_id),
+            context.outer_done,
+            context.qualification_map,
+        )
+    }
+    with EvaluationMonitor(
+        context.root,
+        selection_metric,
+        list(remaining),
+        sorted(expected_outer),
+        sorted(expected_inner),
+        context.existing["inner_metrics"].to_dict(orient="records"),
+        context.existing["outer_metrics"].to_dict(orient="records"),
+        all_config_ids=sorted(current_ids),
+        completed_pairs=completed_pairs,
+        classification=context.dataset.task != "regression",
+    ) as monitor:
+        payloads = [
+            (task.fn, task.args, {**task.kwargs, "checkpoint_root": str(context.root)})
+            for task in tasks
+        ]
+        for result in iter_parallel_tasks(payloads, execution):
+            _checkpoint_result(context.root, result, selection_metric)
+            rows.extend(result)
+            monitor.result(result)
+            completed_jobs += 1
+            completed_fits += int(result.get("fits", 0))
+            failed_fits += _result_failure_count(result)
+            config_id = str(result.get("config_id", ""))
+            remaining[config_id] -= 1
+            if remaining[config_id] == 0:
+                complete = _publish_completed_config(
+                    context.root,
+                    config_id,
+                    expected_outer,
+                    expected_inner,
+                    selection_metric,
+                    bool(manifest.get("gate_enabled", False)),
                 )
-                for split_key, count in split_counts.items()
-            }
-            monitor_thread = Thread(
-                target=_monitor_modality_progress,
-                args=(
-                    progress_queue,
-                    stop_monitor,
-                    prog,
-                    split_tasks,
-                    split_counts,
-                    completed_by_split,
-                    spec_lookup,
-                    candidate_order,
-                    len(context.specs),
-                ),
-                daemon=True,
-            )
-            monitor_thread.start()
-            try:
-                payloads = [
-                    (
-                        task.fn,
-                        task.args,
-                        {**task.kwargs, "progress_queue": progress_queue},
+                if complete:
+                    rows.latest_config_id = config_id
+                    ranked = top_configs(
+                        context.root,
+                        selection_metric,
+                        k=2147483647,
+                        loss=metric_is_loss(selection_metric),
                     )
-                    for task in tasks
-                ]
-                for result in iter_parallel_tasks(payloads, execution):
-                    _checkpoint_result(context.root, result)
-                    rows.extend(result)
-                    completed_jobs += 1
-                    completed_fits += int(result.get("fits", 0))
-                    failed_fits += _result_failure_count(result)
-                    split_key = str(result.get("split_key", ""))
-                    config_id = str(result.get("config_id", ""))
-                    completed_by_split[split_key] = (
-                        completed_by_split.get(split_key, 0) + 1
-                    )
-                    spec = spec_lookup.get(config_id)
-                    if split_key in split_tasks:
-                        label = "completed"
-                        if spec is not None:
-                            label = (
-                                f"completed · {spec.integration.key} · {spec.learner}"
-                            )
-                        prog.update(
-                            split_tasks[split_key],
-                            completed=completed_by_split[split_key],
-                            description=(
-                                f"{split_key} · {completed_by_split[split_key]}/"
-                                f"{split_counts.get(split_key, 0)} jobs · {label} · "
-                                f"last {float(result.get('elapsed_s', 0.0)):.1f}s"
-                            ),
-                        )
-                    prog.update(
-                        overall_task,
-                        completed=completed_jobs,
-                        description=(
-                            f"Evaluation · {execution.workers} workers · "
-                            f"{completed_fits:,} fits · {failed_fits:,} failures · "
-                            "checkpoints current"
-                        ),
-                    )
-            finally:
-                stop_monitor.set()
-                monitor_thread.join(timeout=2.0)
-            prog.update(
-                overall_task,
-                completed=len(tasks),
-                description=(
-                    f"Evaluation · complete · {completed_fits:,} fits · "
-                    f"{failed_fits:,} failures · checkpoints current"
-                ),
-            )
+                    monitor.finalized(config_id, ranked)
+                else:
+                    monitor.unfinished(config_id)
+    success(
+        f"Evaluation finished · {completed_jobs}/{len(tasks)} jobs · "
+        f"{completed_fits:,} fits · {failed_fits:,} failures"
+    )
     return rows
 
 
@@ -1624,17 +1661,22 @@ def _finalize_modality_sweep(
     execution: ExecutionPlan,
     elapsed_s: float,
 ) -> dict[str, Path]:
-    _write_tables(
-        context.root,
-        rows.outer_metrics,
-        rows.inner_metrics,
-        rows.outer_predictions,
-        rows.inner_predictions,
-        rows.qualification,
-        rows.job_resources,
-        existing=context.existing,
-        gate_enabled=sweep.gate.enabled,
-    )
+    expected_outer = {str(split["split_key"]) for split in context.outer_splits}
+    expected_inner = {
+        f"{str(split['split_key'])}__i{i}"
+        for split in context.outer_splits
+        for i in range(len(context.inner_splits_by_outer[str(split["split_key"])]))
+    }
+    for cid in context.configs["config_id"].astype(str):
+        if not (context.root / "configs" / f"{cid}.parquet").exists():
+            _publish_completed_config(
+                context.root,
+                cid,
+                expected_outer,
+                expected_inner,
+                canonical_metric_name(str(sweep.evaluation.optimize_metric)),
+                bool(sweep.gate.enabled),
+            )
     write_mpma_b_selection_outputs(
         context.root, sweep.evaluation.optimize_metric, plan=sweep.ensemble
     )
@@ -1656,6 +1698,18 @@ def _finalize_modality_sweep(
         context.root / "run_summary.json",
     )
     success("Modality configuration sweep completed")
+    metric = canonical_metric_name(str(sweep.evaluation.optimize_metric))
+    ranked = top_configs(
+        context.root, metric, k=2147483647, loss=metric_is_loss(metric)
+    )
+    evaluation_leaders(
+        context.root,
+        metric,
+        ranked,
+        latest_config_id=rows.latest_config_id
+        or latest_ranked_config(context.root, metric),
+        classification=context.dataset.task != "regression",
+    )
     outputs = _existing_outputs(context.root)
     outputs["modality_manifest"] = context.root / "manifest_modalities.json"
     path_table("Configuration sweep outputs", outputs)

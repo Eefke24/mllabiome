@@ -11,6 +11,7 @@ from rich.traceback import install as install_rich_traceback
 from .configs_sweep import Sweep, build_sweep_from_module
 from .console import error, progress, stage, success, warn
 from .figure_export import export_svg_tree
+from .markdown_export import export_markdown_results
 from .pipeline import run_stage
 from .storage import export_tsv_tree
 from .utils import report_html_path
@@ -53,8 +54,10 @@ def main(argv: list[str] | None = None) -> None:
             "all",
             "explore",
             "evaluate",
+            "federated-evaluate",
             "ensemble",
             "inference",
+            "interactive-inference",
             "explain",
             "robustness",
             "report",
@@ -62,6 +65,7 @@ def main(argv: list[str] | None = None) -> None:
         default="all",
         help="Entry point for full execution or stage-level restart.",
     )
+    parser.add_argument("--port", type=int, default=8765)
     parser.add_argument(
         "--explore",
         action="store_true",
@@ -71,6 +75,11 @@ def main(argv: list[str] | None = None) -> None:
         "--redo",
         action="store_true",
         help="Recompute completed outputs instead of reusing them.",
+    )
+    parser.add_argument(
+        "--export-md",
+        action="store_true",
+        help="Export every recorded evaluation configuration and its metrics to Markdown without running any stage.",
     )
     parser.add_argument(
         "--export-tsv",
@@ -88,6 +97,17 @@ def main(argv: list[str] | None = None) -> None:
         help="After report or explore, convert canonical SVG figures to mirrored PDF files under exports/pdf/.",
     )
     args = parser.parse_args(argv)
+    if args.export_md and (
+        args.explore
+        or args.redo
+        or args.export_tsv
+        or args.export_png
+        or args.export_pdf
+        or any(token == "--stage" or token.startswith("--stage=") for token in argv)
+    ):
+        parser.error(
+            "--export-md is standalone and cannot be combined with stages or other exports."
+        )
     if args.explore:
         if args.stage != "all":
             parser.error("Use either --explore or --stage, not both.")
@@ -104,7 +124,25 @@ def main(argv: list[str] | None = None) -> None:
     except Exception as exc:
         error(f"Could not load config: {exc}")
         parser.exit(2)
+    if args.export_md:
+        try:
+            exported = export_markdown_results(sweep.root())
+        except Exception as exc:
+            error(f"Markdown export failed: {exc}")
+            parser.exit(2)
+        stage("Markdown export", str(exported))
+        success(f"All configuration results exported · {exported}")
+        return
     stage("mllabiome", f"config={args.config} · stage={args.stage}")
+    if args.stage == "interactive-inference":
+        from .interactive.launcher import launch
+
+        try:
+            launch(sweep.root(), args.config, port=args.port)
+        except (RuntimeError, FileNotFoundError, ValueError, OSError) as exc:
+            error(str(exc))
+            parser.exit(2)
+        return
     if args.redo:
         sweep.evaluation.redo = True
     run_stage(sweep, args.stage)

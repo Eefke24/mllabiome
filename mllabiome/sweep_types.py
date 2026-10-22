@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from enum import Enum
@@ -13,6 +15,7 @@ from ._evaluation_protocols import (
     normalize_evaluation_protocol,
 )
 from .data import Data
+from .federated.config import Federated
 from .ensemble_aggregation import (
     PROBABILITY_PRESERVING_AGGREGATIONS,
     SUPPORTED_AGGREGATIONS,
@@ -146,6 +149,8 @@ class Evaluation:
     ] = "repeated_nested_cv"
     outer_folds: int = 5
     inner_folds: int = 3
+                                                                                           
+    outer_only: bool = False
     repeats: int = 2
     random_state: int = 42
     split_manifest: str | Path | None = None
@@ -225,10 +230,15 @@ class Ensemble:
         "median_proba",
     )
     optimize_metric: Any = "auto"
+    mpma_b_selection: str = "legacy"
+    mpma_b_softening: str = "none"
+    mpma_b_candidate_learners: tuple[str, ...] = ()
+    ecdf_member_weights: tuple[tuple[str, float], ...] = ()
+    ecdf_reference_learner: str = ""
     include_model_ensembles: bool = True
     late_integrations: tuple[Integration, ...] = ()
 
-    include_inactive: bool = False
+    include_inactive: bool = True
 
     threshold_score: float = 0.30
     threshold_max_members: int = 50
@@ -240,6 +250,41 @@ class Ensemble:
 
     def __post_init__(self) -> None:
         self.optimize_metric = canonical_metric_name(str(self.optimize_metric))
+        self.mpma_b_selection = str(self.mpma_b_selection)
+        self.mpma_b_softening = str(self.mpma_b_softening)
+        self.mpma_b_candidate_learners = tuple(
+            str(value) for value in self.mpma_b_candidate_learners
+        )
+        self.ecdf_member_weights = tuple(
+            (str(name), float(weight)) for name, weight in self.ecdf_member_weights
+        )
+        self.ecdf_reference_learner = str(self.ecdf_reference_learner)
+        names = [name for name, _ in self.ecdf_member_weights]
+        if len(names) != len(set(names)) or any(not name.strip() for name in names):
+            raise ValueError(
+                "ECDF member weights require unique nonempty learner names."
+            )
+        if any(
+            not math.isfinite(weight) or weight <= 0.0
+            for _, weight in self.ecdf_member_weights
+        ):
+            raise ValueError("ECDF member weights must be positive and finite.")
+        if "ecdf_weighted_quantile" in self.aggregation_strategies:
+            if (
+                len(self.ecdf_member_weights) < 2
+                or self.ecdf_reference_learner not in names
+            ):
+                raise ValueError(
+                    "ECDF weighted quantile aggregation requires weights for all members and a valid reference learner."
+                )
+        if any(not value.strip() for value in self.mpma_b_candidate_learners):
+            raise ValueError(
+                "Ensemble.mpma_b_candidate_learners cannot contain empty names."
+            )
+        if self.mpma_b_selection not in {"legacy", "consensus_medoid7"}:
+            raise ValueError("Unsupported MPMA-B selection strategy")
+        if self.mpma_b_softening not in {"none", "discrimination_oof"}:
+            raise ValueError("Unsupported MPMA-B softening strategy")
         self.max_sizes = tuple(int(value) for value in self.max_sizes)
         if self.sizes is not None:
             self.sizes = tuple(int(value) for value in self.sizes)
@@ -562,6 +607,8 @@ def _validate_sweep_configuration(sweep: Any) -> None:
         "best_per_resolution",
         "best_per_learner_type",
         "quality_diversity",
+        "oof_top_k",
+        "oof_similarity",
         "diversity",
         "performance_diversity",
         "caruana",
@@ -627,13 +674,6 @@ def _validate_sweep_configuration(sweep: Any) -> None:
                         f"Remove incompatible aggregation strategy(s) {invalid}; allowed strategies are "
                         f"{sorted(PROBABILITY_PRESERVING_AGGREGATIONS)}."
                     )
-            if (
-                learned
-                and "weighted_mean_proba" not in sweep.ensemble.aggregation_strategies
-            ):
-                raise ValueError(
-                    "Learned ensemble selectors require 'weighted_mean_proba' in Ensemble.aggregation_strategies."
-                )
             if simple and not any(
                 aggregation != "weighted_mean_proba"
                 for aggregation in sweep.ensemble.aggregation_strategies
@@ -925,6 +965,7 @@ class Inference:
     sample_id_col: str | None = None
     feature_policy: str = "strict"
     allow_training_sample_overlap: bool = False
+    save_weights: bool = True
 
     def __post_init__(self) -> None:
         targets = tuple(
@@ -955,6 +996,8 @@ class Inference:
             raise ValueError(
                 "Inference.feature_policy must be 'strict' or 'zero_fill'."
             )
+        if not isinstance(self.save_weights, bool):
+            raise TypeError("Inference.save_weights must be a boolean.")
         sample_id_col = (
             None if self.sample_id_col is None else str(self.sample_id_col).strip()
         )
@@ -982,7 +1025,9 @@ class Sweep:
         default_factory=_default_transformations
     )
     learners: Any = field(default_factory=tuple)
+    learner_resolutions: Mapping[str, Sequence[str]] = field(default_factory=dict)
     evaluation: Evaluation = field(default_factory=Evaluation)
+    federated: Federated | None = None
     gate: QualificationGate = field(default_factory=QualificationGate)
     ensemble: Ensemble = field(default_factory=Ensemble)
     explore: Explore = field(default_factory=Explore)
@@ -1000,6 +1045,39 @@ class Sweep:
 
     def __post_init__(self) -> None:
         validate_model_specs(self.learners, context="Sweep.learners / MODELS")
+        from .resolutions import _parse_resolution
+        from .siamcat import SIAMCATClassifier
+        from .transformations import ScopedTransformation
+
+        siamcat_names = tuple(
+            str(name)
+            for name, estimator in self.learners
+            if isinstance(estimator, SIAMCATClassifier)
+        )
+        if siamcat_names and not self.uses_modalities:
+            original_resolutions = tuple(self.resolutions)
+            existing_names = tuple(
+                dict.fromkeys(
+                    _parse_resolution(item)[0] for item in original_resolutions
+                )
+            )
+            if "species" not in existing_names:
+                self.resolutions = (
+                    *original_resolutions,
+                    ("species", ("species",)),
+                )
+            self.count_transformations = (
+                *tuple(self.count_transformations),
+                ScopedTransformation("relative_abundance", resolutions=("species",)),
+            )
+            restricted = dict(self.learner_resolutions)
+            if "species" not in existing_names:
+                for name, _ in self.learners:
+                    if str(name) not in siamcat_names and str(name) not in restricted:
+                        restricted[str(name)] = existing_names
+            for name in siamcat_names:
+                restricted[name] = ("species",)
+            self.learner_resolutions = restricted
         late_integrations = tuple(
             item
             for item in self.integrations
@@ -1086,7 +1164,9 @@ def build_sweep_from_module(mod: Any) -> Sweep:
             title=getattr(mod, "TITLE", Path(mod.EXPERIMENT_DIR).name),
             experiment_dir=mod.EXPERIMENT_DIR,
             learners=learners,
+            learner_resolutions=getattr(mod, "LEARNER_RESOLUTIONS", {}),
             evaluation=getattr(mod, "EVALUATION", Evaluation()),
+            federated=getattr(mod, "FEDERATED", None),
             gate=getattr(mod, "GATE", QualificationGate()),
             ensemble=ensemble,
             explore=getattr(mod, "EXPLORE", Explore()),
@@ -1147,7 +1227,9 @@ def build_sweep_from_module(mod: Any) -> Sweep:
         resolutions=resolutions,
         count_transformations=count_transformations,
         learners=learners,
+        learner_resolutions=getattr(mod, "LEARNER_RESOLUTIONS", {}),
         evaluation=getattr(mod, "EVALUATION", Evaluation()),
+        federated=getattr(mod, "FEDERATED", None),
         gate=getattr(mod, "GATE", QualificationGate()),
         ensemble=getattr(mod, "ENSEMBLE", Ensemble()),
         explore=getattr(mod, "EXPLORE", Explore()),

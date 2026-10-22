@@ -16,8 +16,8 @@ import pandas as pd
 from ._evaluation_protocols import is_lodo_protocol
 from .baseline_rf import resolve_baseline_rf_configs
 from .configs_sweep import Sweep
-from .console import path_table, phase_progress, stage, success
-from .metrics import canonical_metric_name, compute_metrics, metric_is_loss
+from .console import info, path_table, phase_progress, stage, success
+from .metrics import canonical_metric_name, metric_is_loss
 from .report_compute import run_compute_accounting
 from .report_statistics import run_report_statistics
 from .storage import read_table, table_exists, write_table
@@ -456,94 +456,6 @@ def _display_learner(value: Any, learner_labels: dict[str, str] | None = None) -
     return _human_learner_name(text)
 
 
-_REPORT_ABBREVIATIONS = (
-    ("ALE", "accumulated local effects"),
-    ("ALR", "additive log-ratio"),
-    ("ANCOM-BC2", "Analysis of Compositions of Microbiomes with Bias Correction 2"),
-    ("AP", "average precision"),
-    ("AUCPR", "trapezoidal area under the precision-recall curve"),
-    ("AUROC", "area under the receiver operating characteristic curve"),
-    ("AutoML", "automated machine learning"),
-    ("CI", "confidence interval"),
-    ("CLR", "centered log-ratio"),
-    ("CPU", "central processing unit"),
-    ("CV", "cross-validation"),
-    ("ECDF", "empirical cumulative distribution function"),
-    ("F1", "harmonic mean of precision and recall"),
-    ("F1w", "support-weighted F1 score"),
-    ("FDR", "false discovery rate"),
-    ("FLAML", "Fast and Lightweight AutoML"),
-    ("FN", "false negative"),
-    ("FP", "false positive"),
-    ("GiB", "gibibyte"),
-    ("HC3", "heteroskedasticity-consistent covariance estimator, type 3"),
-    ("ID", "identifier"),
-    ("ILR", "isometric log-ratio"),
-    ("IQR", "interquartile range"),
-    ("LIME", "Local Interpretable Model-agnostic Explanations"),
-    ("LODO", "leave-one-dataset-out"),
-    ("MAE", "mean absolute error"),
-    ("MCC", "Matthews correlation coefficient"),
-    ("mdFDR", "mixed directional false discovery rate"),
-    ("ML", "machine learning"),
-    ("MPDR", "Microbiota profile data representation"),
-    ("MPMA", "Microbiota profile modelling algorithm"),
-    ("MPMA-B", "Microbiota profile modelling algorithm - base"),
-    ("MPMA-E", "Microbiota profile modelling algorithm - ensemble"),
-    ("MSE", "mean squared error"),
-    ("N", "number of evaluated observations"),
-    ("NA", "not available"),
-    ("NPV", "negative predictive value"),
-    ("OOF", "out-of-fold"),
-    ("OvR", "one-vs-rest"),
-    ("P/A", "presence/absence"),
-    ("PCoA", "principal coordinates analysis"),
-    ("PERMANOVA", "permutational multivariate analysis of variance"),
-    ("PERMDISP", "permutational analysis of multivariate dispersions"),
-    ("PPV", "positive predictive value"),
-    ("QN", "quantile normalization"),
-    ("Q1", "first quartile"),
-    ("Q3", "third quartile"),
-    ("RA", "relative abundance"),
-    ("RAM", "random-access memory"),
-    ("RF", "random forest"),
-    ("RMSE", "root mean squared error"),
-    ("ROC", "receiver operating characteristic"),
-    ("R²", "coefficient of determination"),
-    ("SD", "standard deviation"),
-    ("SHAP", "SHapley Additive exPlanations"),
-    (
-        "SIAMCAT",
-        "Statistical Inference of Associations between Microbial Communities And host phenoTypes",
-    ),
-    ("SMD", "standardized mean difference"),
-    ("TN", "true negative"),
-    ("TP", "true positive"),
-    ("YJ", "Yeo-Johnson"),
-    ("ε", "training-derived half-minimum positive relative-abundance pseudocount"),
-)
-
-
-def _abbreviations_html(heading_level: int = 2) -> str:
-
-    level = min(6, max(1, int(heading_level)))
-
-    rows = "".join(
-        "<tr>"
-        f"<td><strong>{html.escape(abbreviation)}</strong></td>"
-        f"<td>{html.escape(definition)}</td>"
-        "</tr>"
-        for abbreviation, definition in _REPORT_ABBREVIATIONS
-    )
-
-    return (
-        f'<h{level} id="abbreviations">Abbreviations</h{level}>'
-        '<div class="table-wrap"><table><thead><tr>'
-        "<th>Abbreviation or symbol</th><th>Meaning</th>"
-        f"</tr></thead><tbody>{rows}</tbody></table></div>"
-    )
-
-
 def _display_data_format(value: Any) -> str:
 
     text = str(value).strip()
@@ -640,10 +552,10 @@ def _report_nav_html(
         '<a href="#performance-evaluation">Task and evaluation</a>'
         + exploration_link
         + '<a href="#performance-summary">Machine learning performance evaluation</a>'
-        + '<a href="#explainability">Explainability</a>'
+        + '<a href="#explainability-summary">Explainability summary</a>'
+        + '<a href="#explainability">Explainability detail</a>'
         + robustness_link
         + '<a href="#compute">Computational resources</a>'
-        '<a href="#abbreviations">Abbreviations</a>'
         "</nav></div></header>"
         '<script>document.addEventListener("click",function(e){const a=e.target.closest(".report-links a[href^=\'#\'],.brand[href^=\'#\']");if(!a)return;const id=decodeURIComponent(a.getAttribute("href").slice(1));const t=document.getElementById(id);if(!t)return;e.preventDefault();t.scrollIntoView({behavior:"smooth",block:"start"})})</script>'
     )
@@ -671,7 +583,12 @@ def _performance_methodology_html(protocol: Any, n_bootstrap: int = 2000) -> str
         "Precision and recall are macro-averaged across classes."
     )
 
-    return f"<p>{html.escape(uncertainty)}{html.escape(metrics)}</p>"
+    qualification = (
+        " MPMA-B and MPMA-E use a single final specification selected from all development inner-validation evidence, "
+        "evaluated retrospectively using the saved held-out predictions of its constituent pipeline or members. "
+        "These fixed-specification cross-validation estimates can be optimistic after selection and are not independent external validation."
+    )
+    return f"<p>{html.escape(uncertainty)}{html.escape(metrics)}{html.escape(qualification)}</p>"
 
 
 def _inferential_layer_html(protocol: Any, metric: Any) -> str:
@@ -698,7 +615,11 @@ def _inferential_layer_html(protocol: Any, metric: Any) -> str:
             "For higher-is-better metrics, a positive difference favors Strategy A. For loss metrics, a negative difference favors Strategy A."
         )
 
-    return f"<p><strong>Inferential layer.</strong> {body}</p>"
+    qualification = (
+        " Comparisons involving retrospectively selected fixed MPMA-B or MPMA-E specifications are exploratory, "
+        "because selection reused evidence from the development cohort; p-values and intervals do not correct for this selection."
+    )
+    return f"<p><strong>Inferential layer.</strong> {body}{qualification}</p>"
 
 
 def _top_mpma_heading(table: pd.DataFrame) -> str:
@@ -717,6 +638,7 @@ REPORT_LAYERS = (
     "inferential_comparisons",
     "selected_specifications",
     "important_features",
+    "explainability_summary",
     "explainability",
     "robustness",
     "compute_hardware",
@@ -1238,139 +1160,17 @@ def _selected_json(root: Path) -> dict[str, Any]:
 
 
 def _best_mpma_row(root: Path) -> dict[str, Any]:
+    from .fixed_final_performance import fixed_final_outer_performance
 
-    nested = _read_json(root / "tables" / "mpma_b_strategy_summary.json")
-
-    if isinstance(nested, dict) and nested:
-        return nested
-
-    selected = _selected_json(root)
-
-    best = (
-        selected.get("inner_val_best_mpma")
-        or selected.get("inner_val_best_individual")
-        or {}
-    )
-
-    return best if isinstance(best, dict) else {}
-
-
-def _ensemble_outer_metrics_from_predictions(
-    root: Path, ensemble_config_id: str
-) -> dict[str, Any]:
-
-    path = root / "ensembling" / "ensemble_predictions.parquet"
-
-    if not table_exists(path) or not str(ensemble_config_id):
-        return {}
-
-    df = _read_table(path)
-
-    if (
-        df.empty
-        or "ensemble_config_id" not in df.columns
-        or "outer_split_key" not in df.columns
-    ):
-        return {}
-
-    df = df[df["ensemble_config_id"].astype(str).eq(str(ensemble_config_id))].copy()
-
-    if df.empty:
-        return {}
-
-    pcols = [c for c in df.columns if c.startswith("proba_")]
-
-    if not pcols or "y_true" not in df.columns or "y_pred" not in df.columns:
-        return {}
-
-    classes = np.arange(len(pcols), dtype=int)
-
-    fold_rows: list[dict[str, float]] = []
-
-    for _, sub in df.groupby("outer_split_key", sort=False):
-        yy = pd.to_numeric(sub["y_true"], errors="coerce")
-
-        mask = yy.notna()
-
-        y_true = yy.loc[mask].astype(int).to_numpy()
-
-        y_pred = (
-            pd.to_numeric(sub.loc[mask, "y_pred"], errors="coerce")
-            .fillna(0)
-            .astype(int)
-            .to_numpy()
-        )
-
-        proba = (
-            sub.loc[mask, pcols]
-            .apply(pd.to_numeric, errors="coerce")
-            .to_numpy(dtype=float)
-        )
-
-        if len(y_true) == 0 or proba.shape[0] != len(y_true):
-            continue
-
-        fold_rows.append(compute_metrics(y_true, y_pred, proba, classes))
-
-    if not fold_rows:
-        return {}
-
-    tab = pd.DataFrame(fold_rows)
-
-    out: dict[str, Any] = {}
-
-    for col in tab.columns:
-        vals = (
-            pd.to_numeric(tab[col], errors="coerce")
-            .replace([np.inf, -np.inf], np.nan)
-            .dropna()
-        )
-
-        if vals.empty:
-            continue
-
-        out[f"outer_{col}_mean"] = float(vals.mean())
-
-        out[f"outer_{col}_std"] = float(vals.std(ddof=1)) if len(vals) > 1 else 0.0
-
-        out[f"outer_{col}_count"] = len(vals)
-
-        out[f"{col}_mean"] = out[f"outer_{col}_mean"]
-
-        out[f"{col}_std"] = out[f"outer_{col}_std"]
-
-        out[f"{col}_count"] = out[f"outer_{col}_count"]
-
-    return out
+    _, summary = fixed_final_outer_performance(root, "MPMA-B", persist=True)
+    return summary
 
 
 def _ensemble_row(root: Path) -> dict[str, Any]:
+    from .fixed_final_performance import fixed_final_outer_performance
 
-    nested = _read_json(root / "ensembling" / "mpma_e_strategy_summary.json")
-
-    if isinstance(nested, dict) and nested:
-        return nested
-
-    selected = _selected_json(root)
-
-    ens = (
-        selected.get("inner_val_best_mpmas_ensemble")
-        or selected.get("inner_val_best_ensemble")
-        or {}
-    )
-
-    if not isinstance(ens, dict):
-        return {}
-
-    row = dict(ens)
-
-    eid = str(row.get("ensemble_config_id", ""))
-
-    for k, v in _ensemble_outer_metrics_from_predictions(root, eid).items():
-        if k not in row or not np.isfinite(_safe_float(row.get(k))):
-            row[k] = v
-
-    return row
+    _, summary = fixed_final_outer_performance(root, "MPMA-E", persist=True)
+    return summary
 
 
 def _ensemble_final_candidate(root: Path) -> dict[str, Any]:
@@ -1471,6 +1271,16 @@ def _strategy_rows(
 
         sort_ascending = metric_is_loss(sort_metric)
 
+        configs = _read_table(root / "configs.parquet")
+        if {"config_id", "learner_class"}.issubset(configs.columns):
+            class_metadata = configs[["config_id", "learner_class"]].copy()
+            class_metadata["config_id"] = class_metadata["config_id"].astype(str)
+            class_metadata = class_metadata.drop_duplicates("config_id", keep="last")
+            base["config_id"] = base["config_id"].astype(str)
+            base = base.merge(
+                class_metadata, on="config_id", how="left", validate="many_to_one"
+            )
+
         learner = base.get(
             "learner", pd.Series("", index=base.index, dtype=str)
         ).astype(str)
@@ -1501,8 +1311,7 @@ def _strategy_rows(
         if automl:
             by_strategy["AutoML"] = {"Strategy": "AutoML", "source": "mpma", **automl}
 
-        configs = _read_table(root / "configs.parquet")
-        baseline_configs = resolve_baseline_rf_configs(configs)
+        baseline_configs = resolve_baseline_rf_configs(configs, active_only=False)
         baseline = {}
         if not baseline_configs.empty and "config_id" in baseline_configs.columns:
             baseline_id = str(baseline_configs.iloc[0]["config_id"])
@@ -1521,14 +1330,41 @@ def _strategy_rows(
                 **baseline,
             }
 
-        siamcat_mask = learner.str.fullmatch("SIAMCAT", case=False).fillna(False)
+        from .evaluation_predictions import (
+            comparator_config_ids,
+            load_evaluation_predictions,
+        )
+
+        siamcat_ids = comparator_config_ids(root, "SIAMCAT")
+        siamcat_mask = learner.str.fullmatch(r"SIAMCAT(?:[_ -].*)?", case=False).fillna(
+            False
+        )
         siamcat_mask |= learner_class.str.endswith("SIAMCATClassifier", na=False)
         siamcat = _pick(
             siamcat_mask
-            & transform.str.fullmatch("identity", case=False).fillna(False)
-            & resolution.str.fullmatch("raw", case=False).fillna(False)
+            & transform.str.fullmatch(
+                r"relative_abundance@rank-wise", case=False
+            ).fillna(False)
+            & resolution.str.fullmatch("species", case=False).fillna(False)
+            & base["config_id"].astype(str).isin(siamcat_ids)
         )
 
+        if siamcat:
+            try:
+                load_evaluation_predictions(root, "SIAMCAT", selection_metric)
+            except ValueError as exc:
+                message = str(exc)
+                incomplete = (
+                    "No complete outer-fold inner-validation selections" in message
+                    or "do not match the persisted outer-test split set" in message
+                    or "prediction and selection outer splits differ" in message
+                )
+                if not incomplete:
+                    raise
+                info(
+                    f"SIAMCAT excluded from report until evaluation is complete: {message}"
+                )
+                siamcat = {}
         if siamcat:
             by_strategy["SIAMCAT"] = {
                 "Strategy": "SIAMCAT",
@@ -1547,7 +1383,7 @@ def _baseline_rf_report_note(rows: list[dict[str, Any]]) -> str:
     if not any(str(row.get("Strategy", "")) == "Baseline RF" for row in rows):
         return ""
     return (
-        "<p><strong>Baseline RF protocol.</strong> Deepest active eligible single taxonomic rank (strain, species, or genus); "
+        "<p><strong>Baseline RF protocol.</strong> Deepest eligible completed single taxonomic rank (strain, species, or genus); "
         "within-rank relative abundance followed by arcsine-square-root transformation; no prevalence filtering; "
         "RandomForestClassifier with 1,000 trees and minimum leaf size 5. All remaining random-forest "
         "hyperparameters use scikit-learn defaults; no dataset-specific random-forest hyperparameter tuning is performed.</p>"
@@ -2007,7 +1843,7 @@ def _procedure_table(sweep: Sweep, root: Path) -> pd.DataFrame:
         ],
         [
             "Selection rule",
-            "Reported performance uses held-out outer evaluation predictions.",
+            "MPMA-B and MPMA-E show retrospective outer-fold scores for one final selected specification each; selection may make these scores optimistic. Independent external performance must be evaluated separately.",
         ],
     ]
 
@@ -2533,6 +2369,13 @@ def _publication_layout_css() -> str:
 def _report_css() -> str:
 
     return """
+
+.xai-svg-figure { margin:18px 0 10px; width:100%; }
+.xai-svg-figure a { display:block; }
+.xai-svg-embed { display:block; width:100%; height:auto; max-width:100%; border:1px solid var(--track); background:#fff; }
+.xai-svg-download { display:flex; align-items:center; gap:12px; margin:10px 0 22px; flex-wrap:wrap; }
+.xai-svg-download a { font-weight:650; }
+.xai-detailed-svg { display:block; width:100%; height:auto; }
 :root {
   --ink:#0f172a; --mid:#64748b; --dim:#94a3b8; --track:#e2e8f0; --soft:#f8fafc;
   --bg:#ffffff; --blue:#2563eb; --blue-hover:#0ea5e9; --blue-soft:#eff6ff; --blue-hover-soft:#f0f9ff;
@@ -2651,6 +2494,7 @@ class _ReportVisuals:
     representation_figure: str
     mpma_e_figure: str
     explainability_html: str
+    explainability_summary_html: str
     explainability_count: int
 
 
@@ -2783,10 +2627,14 @@ def _build_report_visuals(
             report_dir,
             top_n=int(getattr(sweep.explainability, "top_k", 15)),
         )
+        from .report_explainability_summary import explainability_summary_block
+
+        explainability_summary_html = explainability_summary_block(root, report_dir)
     return _ReportVisuals(
         representation_figure=representation_figure,
         mpma_e_figure=mpma_e_figure,
         explainability_html=explainability_html,
+        explainability_summary_html=explainability_summary_html,
         explainability_count=explainability_count,
     )
 
@@ -3401,6 +3249,8 @@ def _render_report_html(
 {_performance_methodology_html(sweep.evaluation.protocol, 2000)}
 {_html_table(analysis.strategy_html, raw_html_cols=strategy_metric_cols)}
 {_baseline_rf_report_note(analysis.strategy_rows)}
+<h2 id=\"explainability-summary\">Explainability summary</h2>
+{visuals.explainability_summary_html}
 <h2 id=\"representation-impact\">Data representations and learner impact on performance</h2>
 {_representation_impact_note(str(sweep.evaluation.optimize_metric), bool(getattr(sweep, "uses_modalities", False)))}
 {representation_figure}
@@ -3427,7 +3277,6 @@ def _render_report_html(
 {_html_table(analysis.compute_display)}
 <h4>Hardware and runtime environment</h4>
 {hardware_html}
-{_abbreviations_html()}
 {_report_footer_html()}
 </main></div></body></html>
 """
@@ -3457,6 +3306,11 @@ def _write_report_manifest(
                 ]
             ),
             "explainability_targets": visuals.explainability_count,
+            "explainability_composite_svg": (
+                "explainability_composite.svg"
+                if (report_dir / "explainability_composite.svg").exists()
+                else None
+            ),
         },
         report_dir / "report_manifest.json",
     )
@@ -3491,6 +3345,9 @@ def _report_outputs(
         "important_features": tables.feature_summary_path,
         "hardware_environment": tables.hardware_summary_path,
     }
+    composite_svg = report_dir / "explainability_composite.svg"
+    if composite_svg.is_file():
+        outputs["explainability_composite_svg"] = composite_svg
     if emit_html:
         outputs = {"html_report": report_html_path(report_dir.parent), **outputs}
     return outputs

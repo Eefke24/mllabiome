@@ -17,6 +17,8 @@ EXPERIMENT_DIR/
 ```
 
 Important artefacts include candidate metrics, out-of-fold predictions, MPMA-B selection outputs, ensemble selection metadata, method-specific explainability tables, robustness summaries, and report figures.
+Optional inference and experiment outputs depend on the configured stages. The inference workflow can reuse selected fitted preprocessing and learner pipelines; see [Inference](./inference).
+
 ## Re-running stages
 
 Runs are designed to be restartable. To regenerate only the report:
@@ -46,4 +48,4 @@ For a manuscript or archived analysis, retain:
 The package records software and experiment provenance in run artefacts. For archival publication, pair those artefacts with a tagged software release and an external archive such as Zenodo.
 ## Version used by these docs
 
-These pages describe mllabiome version `0.1.1`. The repository examples should be treated as the canonical source for the exact current configuration syntax.
+These pages describe mllabiome version `0.2.0`. The repository examples should be treated as the canonical source for the exact current configuration syntax.

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+
 import hashlib
 import importlib
 import json
@@ -8,9 +9,12 @@ import re
 from pathlib import Path
 from typing import Any
 
+
 import joblib
 import numpy as np
 import pandas as pd
+from sklearn.pipeline import Pipeline
+
 
 from ._version import __version__
 from .compute import ResourceTracker, machine_profile
@@ -43,6 +47,7 @@ from .transformations import (
     transformation_label,
 )
 from .utils import dump_json_standard
+
 
 _DEPLOYMENT_SCHEMA = 1
 _INFERENCE_SCHEMA = 1
@@ -278,13 +283,7 @@ def _selected_levels(sweep: Sweep, model: dict[str, Any]) -> tuple[str, ...]:
 
 
 def _abundance_scale(X: np.ndarray) -> str:
-    """Infer the coarse abundance scale used by a samples x features matrix.
 
-    A relative-abundance profile remains on the proportion scale after projection
-    onto a training feature universe even when the retained features sum to less
-    than one.  Treat such subcompositions as proportions instead of generic
-    non-negative abundance.
-    """
     values = np.asarray(X, dtype=float)
     if values.ndim != 2:
         raise ValueError(
@@ -316,16 +315,11 @@ def _abundance_scale(X: np.ndarray) -> str:
         np.mean(np.isclose(informative_totals, 100.0, rtol=0.03, atol=2.0))
     )
 
-    # Exact/near-exact compositions.
     if proportion_fraction >= 0.80:
         return "proportion"
     if percentage_fraction >= 0.80:
         return "percentage"
 
-    # External profiles are commonly projected onto the training feature schema.
-    # Taxa absent from the training universe are then dropped, so a valid
-    # relative-abundance sample can sum to < 1.  The values are still fractions
-    # on the same scale and must not be rejected as "nonnegative_abundance".
     proportion_upper = 1.0 + 0.03
     projected_proportion_fraction = float(
         np.mean(
@@ -342,7 +336,7 @@ def _abundance_scale(X: np.ndarray) -> str:
 
 
 def _transformation_base_token(model: dict[str, Any]) -> str:
-    """Return a normalized base abundance-transformation name."""
+
     identity = str(model.get("count_transformation", "")).strip()
     if not identity:
         return ""
@@ -356,13 +350,7 @@ def _scale_validation_mode(
     training_scale: str,
     inference_scale: str,
 ) -> str:
-    """Describe whether raw-scale validation is required for this member.
 
-    Presence/absence discards abundance magnitude entirely, so rejecting an
-    otherwise schema-compatible external dataset because its raw abundance units
-    differ is unnecessary.  Other transformations retain the existing strict
-    scale check.
-    """
     if _transformation_base_token(model) == "presence_absence":
         return "skipped_presence_absence"
     if training_scale == inference_scale:
@@ -521,6 +509,16 @@ def _import_class(path: str) -> type[Any]:
     raise ImportError(f"Cannot import persisted learner class {path!r}.")
 
 
+def _instantiate_persisted_estimator(cls: type[Any], params: dict[str, Any]) -> Any:
+    direct = {key: value for key, value in params.items() if "__" not in key}
+    if issubclass(cls, Pipeline):
+        steps = direct["steps"]
+        direct["steps"] = [(name, estimator) for name, estimator in steps]
+        for name, _ in direct["steps"]:
+            direct.pop(name, None)
+    return cls(**direct)
+
+
 def _restore_persisted_value(value: Any) -> Any:
     if isinstance(value, str):
         if value == "nan":
@@ -542,12 +540,7 @@ def _restore_persisted_value(value: Any) -> Any:
             str(key): _restore_persisted_value(item)
             for key, item in value["params"].items()
         }
-        direct = {key: item for key, item in params.items() if "__" not in key}
-        nested = {key: item for key, item in params.items() if "__" in key}
-        obj = cls(**direct)
-        if nested and callable(getattr(obj, "set_params", None)):
-            obj.set_params(**nested)
-        return obj
+        return _instantiate_persisted_estimator(cls, params)
     return {str(key): _restore_persisted_value(item) for key, item in value.items()}
 
 
@@ -573,15 +566,7 @@ def _learner_item(sweep: Sweep, model: dict[str, Any]) -> Any:
         params = {
             str(key): _restore_persisted_value(value) for key, value in parsed.items()
         }
-        direct = {key: value for key, value in params.items() if "__" not in key}
-        nested = {key: value for key, value in params.items() if "__" in key}
-        estimator = cls(**direct)
-        if nested:
-            if not callable(getattr(estimator, "set_params", None)):
-                raise TypeError(
-                    f"Persisted learner {class_path!r} has nested parameters but no set_params()."
-                )
-            estimator.set_params(**nested)
+        estimator = _instantiate_persisted_estimator(cls, params)
         return (name, estimator)
     matches = [item for item in sweep.learners if _learner_name(item) == name]
     if len(matches) != 1:
@@ -609,12 +594,13 @@ def _fit_member(
     profile_names: list[str],
     model: dict[str, Any],
     deployment_dir: Path,
-) -> tuple[dict[str, Any], np.ndarray, dict[str, Any]]:
+    save_weights: bool,
+) -> tuple[dict[str, Any] | None, np.ndarray, dict[str, Any]]:
     config_id = str(model["config_id"])
     signature = _member_signature(dataset, model)
     bundle_path = deployment_dir / "members" / f"{config_id}.joblib"
     bundle = None
-    if bundle_path.exists():
+    if save_weights and bundle_path.exists():
         try:
             candidate = joblib.load(bundle_path)
             if isinstance(candidate, dict) and candidate.get("signature") == signature:
@@ -625,9 +611,6 @@ def _fit_member(
     train_X, train_names, blocks = materialize_mpdr_with_blocks(dataset, levels)
     test_raw, test_names = _profile_resolution(profile_X, profile_names, levels)
 
-    # First align the external matrix to the exact raw feature schema used by the
-    # persisted member.  Scale validation must compare equivalent matrices, not
-    # a training-resolution matrix with an unaligned external-resolution matrix.
     test_X, audit = _align_resolution(
         np.asarray(train_X, dtype=np.float64),
         list(train_names),
@@ -661,6 +644,8 @@ def _fit_member(
         learner = _learner_item(sweep, model)
         _, learner_factory = _learner_factory(learner, task=dataset.task)
         estimator = configure_estimator_threads(learner_factory(), 1)
+        if callable(getattr(estimator, "bind_schema", None)):
+            estimator.bind_schema(transformer.get_feature_names_out(list(train_names)))
         if dataset.task == "classification":
             groups = _groups_from_metadata(dataset.metadata, sweep.data.group_col)
             fit_classifier(estimator, train_transformed, dataset.y, groups)
@@ -685,7 +670,8 @@ def _fit_member(
             "transformer": transformer,
             "estimator": estimator,
         }
-        _atomic_joblib(bundle, bundle_path)
+        if save_weights:
+            _atomic_joblib(bundle, bundle_path)
     else:
         expected_names = [str(value) for value in bundle.get("raw_feature_names", [])]
         if expected_names != list(train_names):
@@ -729,10 +715,10 @@ def _fit_member(
             "inference_abundance_scale": inference_scale,
             "abundance_scale_validation": scale_validation,
             "deployment_signature": signature,
-            "bundle_path": str(bundle_path),
+            "bundle_path": str(bundle_path) if save_weights else None,
         }
     )
-    return bundle, predictions, audit
+    return bundle if save_weights else None, predictions, audit
 
 
 def _strategy_predictions(
@@ -742,17 +728,24 @@ def _strategy_predictions(
     profile_names: list[str],
     models: dict[str, Any],
     deployment_dir: Path,
+    save_weights: bool,
     strategy: str,
-    member_cache: dict[str, tuple[dict[str, Any], np.ndarray, dict[str, Any]]],
+    member_cache: dict[str, tuple[dict[str, Any] | None, np.ndarray, dict[str, Any]]],
 ) -> tuple[np.ndarray, list[dict[str, Any]]]:
     if strategy == "MPMA-B":
         model = models["MPMA-B"]
         config_id = str(model["config_id"])
         if config_id not in member_cache:
             member_cache[config_id] = _fit_member(
-                sweep, dataset, profile_X, profile_names, model, deployment_dir
+                sweep, dataset, profile_X, profile_names, model, deployment_dir, save_weights
             )
-        return member_cache[config_id][1], [member_cache[config_id][2]]
+        probabilities = member_cache[config_id][1]
+        alpha = float(model.get("probability_softening_alpha", 0.0))
+        if alpha > 0.0:
+            from .mpma_vnext import soften_probabilities
+
+            probabilities = soften_probabilities(probabilities, alpha)
+        return probabilities, [member_cache[config_id][2]]
     unit = models.get("MPMA-E")
     if not isinstance(unit, dict):
         raise ValueError(
@@ -764,7 +757,7 @@ def _strategy_predictions(
         config_id = str(member["config_id"])
         if config_id not in member_cache:
             member_cache[config_id] = _fit_member(
-                sweep, dataset, profile_X, profile_names, member, deployment_dir
+                sweep, dataset, profile_X, profile_names, member, deployment_dir, save_weights
             )
         member_predictions.append(member_cache[config_id][1])
         audits.append(member_cache[config_id][2])
@@ -888,9 +881,38 @@ def run_inference(
     )
     inference_root = root / "inference"
     deployment_dir = inference_root / "deployment"
+    if sweep.inference.save_weights:
+        deployment_dir.mkdir(parents=True, exist_ok=True)
+        background_path = deployment_dir / "background.npz"
+        fingerprint = dataset_fingerprint(training)
+        replace_background = True
+        if background_path.is_file():
+            try:
+                with np.load(background_path, allow_pickle=False) as existing:
+                    replace_background = str(existing["fingerprint"].item()) != fingerprint
+            except (ValueError, OSError, KeyError):
+                pass
+        if replace_background:
+            rng = np.random.default_rng(int(sweep.evaluation.random_state))
+            rows = np.sort(
+                rng.choice(
+                    len(training.sample_ids),
+                    size=min(32, len(training.sample_ids)),
+                    replace=False,
+                )
+            )
+            temp = background_path.with_suffix(".tmp")
+            with temp.open("wb") as handle:
+                np.savez_compressed(
+                    handle,
+                    X=training.X_by_level["all"][rows],
+                    names=np.asarray(training.feature_names_by_level["all"], dtype=str),
+                    fingerprint=np.asarray(fingerprint),
+                )
+            temp.replace(background_path)
     inference_root.mkdir(parents=True, exist_ok=True)
     tracker = ResourceTracker().start()
-    member_cache: dict[str, tuple[dict[str, Any], np.ndarray, dict[str, Any]]] = {}
+    member_cache: dict[str, tuple[dict[str, Any] | None, np.ndarray, dict[str, Any]]] = {}
     strategy_values: dict[str, np.ndarray] = {}
     audits: list[dict[str, Any]] = []
     try:
@@ -902,6 +924,7 @@ def run_inference(
                 profile_names,
                 models,
                 deployment_dir,
+                sweep.inference.save_weights,
                 strategy,
                 member_cache,
             )
@@ -909,6 +932,17 @@ def run_inference(
             audits.extend(rows)
     finally:
         resources = tracker.stop()
+    samples_path = inference_root / "samples.npz"
+    temp = samples_path.with_suffix(".tmp")
+    with temp.open("wb") as handle:
+        np.savez_compressed(
+            handle,
+            X=profile_X,
+            names=np.asarray(profile_names, dtype=str),
+            samples=np.asarray(sample_ids, dtype=str),
+            fingerprint=np.asarray(input_audit["abundance_sha256"]),
+        )
+    temp.replace(samples_path)
     predictions = _prediction_frame(sample_ids, training, strategy_values)
     predictions_path = inference_root / "predictions.tsv"
     _atomic_tsv(predictions, predictions_path)
@@ -945,15 +979,17 @@ def run_inference(
     )
     feature_audit_path = inference_root / "feature_audit.tsv"
     _atomic_tsv(feature_audit, feature_audit_path)
-    deployment_manifest = _deployment_manifest(
-        sweep,
-        training,
-        models,
-        requested,
-        list(unique_audits.values()),
-    )
-    deployment_manifest_path = deployment_dir / "manifest.json"
-    dump_json_standard(deployment_manifest, deployment_manifest_path)
+    deployment_manifest_path = None
+    if sweep.inference.save_weights:
+        deployment_manifest = _deployment_manifest(
+            sweep,
+            training,
+            models,
+            requested,
+            list(unique_audits.values()),
+        )
+        deployment_manifest_path = deployment_dir / "manifest.json"
+        dump_json_standard(deployment_manifest, deployment_manifest_path)
     manifest = {
         "schema_version": _INFERENCE_SCHEMA,
         "package_version": __version__,
@@ -964,15 +1000,19 @@ def run_inference(
         "inference_samples": len(sample_ids),
         "input": input_audit,
         "feature_policy": sweep.inference.feature_policy,
+        "save_weights": sweep.inference.save_weights,
         "training_outcomes_used_for_full_fit": True,
         "inference_outcomes_used_for_fit_or_prediction": False,
         "inference_metadata_used_as_predictors": False,
         "predictions": str(predictions_path),
+        "samples": str(samples_path),
         "predictions_with_metadata": None
         if metadata_predictions_path is None
         else str(metadata_predictions_path),
         "feature_audit": str(feature_audit_path),
-        "deployment_manifest": str(deployment_manifest_path),
+        "deployment_manifest": None
+        if deployment_manifest_path is None
+        else str(deployment_manifest_path),
         "resources": resources,
         "machine": machine_profile(),
         "python_version": platform.python_version(),
@@ -983,8 +1023,9 @@ def run_inference(
         "predictions": predictions_path,
         "feature_audit": feature_audit_path,
         "manifest": manifest_path,
-        "deployment_manifest": deployment_manifest_path,
     }
+    if deployment_manifest_path is not None:
+        outputs["deployment_manifest"] = deployment_manifest_path
     if metadata_predictions_path is not None:
         outputs["predictions_with_metadata"] = metadata_predictions_path
     return outputs
