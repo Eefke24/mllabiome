@@ -31,9 +31,16 @@ def _specification(root: Path, strategy: str) -> dict[str, Any]:
 
 def _prediction_columns(frame: pd.DataFrame) -> list[str]:
     columns = [str(column) for column in frame.columns if str(column).startswith("proba_")]
-    columns = sorted(columns, key=lambda column: int(column.removeprefix("proba_")))
-    if not columns or columns != [f"proba_{index}" for index in range(len(columns))]:
+    suffixes = [column.removeprefix("proba_") for column in columns]
+    if not columns or any(not suffix for suffix in suffixes) or len(set(suffixes)) != len(suffixes):
         raise ValueError("Fixed-final evaluation requires consecutive probability columns")
+    numeric = [suffix.isdecimal() for suffix in suffixes]
+    if any(numeric) and not all(numeric):
+        raise ValueError("Fixed-final evaluation cannot mix numeric and named probability columns")
+    if all(numeric):
+        columns = sorted(columns, key=lambda column: int(column.removeprefix("proba_")))
+        if columns != [f"proba_{index}" for index in range(len(columns))]:
+            raise ValueError("Fixed-final evaluation requires consecutive probability columns")
     return columns
 
 
