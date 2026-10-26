@@ -1762,67 +1762,182 @@ def _multilabel_oof_summary(
     ax.figure.savefig(figure_path, dpi=160)
     plt.close(ax.figure)
 
-    correct = y_true.eq(y_predicted).where(known)
-    observed_per_row = known.sum(axis=1).astype(int)
-    correct_per_row = correct.sum(axis=1).astype(int)
-    accuracy_rows = pd.DataFrame(
-        {
-            "repeat": [str(key).split(chr(0), 1)[0] for key in y_true.index],
-            "correct": correct_per_row.to_numpy(dtype=int),
-            "observed": observed_per_row.to_numpy(dtype=int),
-        }
+    patient_detection, control_accuracy, detection_figure, control_figure = (
+        _multilabel_patient_detection(children, report_dir)
     )
-    accuracy_rows = accuracy_rows.loc[accuracy_rows["observed"] > 0].copy()
-    accuracy_rows["category"] = (
-        accuracy_rows["correct"].astype(str)
-        + "/"
-        + accuracy_rows["observed"].astype(str)
-        + " correct"
+    return (
+        metrics,
+        figure_path,
+        patient_detection,
+        detection_figure,
+        control_accuracy,
+        control_figure,
     )
-    accuracy_rows["proportion"] = (
-        accuracy_rows["correct"] / accuracy_rows["observed"]
-    )
-    repeats = sorted(accuracy_rows["repeat"].unique())
-    categories = (
-        accuracy_rows[["category", "correct", "observed", "proportion"]]
-        .drop_duplicates()
-        .sort_values(["proportion", "observed"], ascending=[False, False])
-    )
-    count_table = (
-        accuracy_rows.groupby(["category", "repeat"], observed=True)
-        .size()
-        .unstack(fill_value=0)
-        .reindex(index=categories["category"], columns=repeats, fill_value=0)
-    )
-    total_per_repeat = accuracy_rows.groupby("repeat").size().reindex(repeats)
-    distribution = pd.DataFrame(
-        {
-            "Correct / observed": categories["category"].to_numpy(),
-            "Correct fraction": categories["proportion"].to_numpy(dtype=float),
-        }
-    )
-    plot_values: dict[str, np.ndarray] = {}
-    for repeat in repeats:
-        percentages = (
-            count_table[repeat].to_numpy(dtype=float)
-            / float(total_per_repeat.loc[repeat])
-            * 100.0
-        )
-        distribution[f"{repeat} patients"] = count_table[repeat].to_numpy(dtype=int)
-        distribution[f"{repeat} percent"] = percentages
-        plot_values[repeat] = percentages
 
-    distribution_figure = report_dir / "figures" / "multilabel_patient_accuracy.png"
-    plot_frame = pd.DataFrame(plot_values, index=categories["category"])
-    ax = plot_frame.plot(kind="bar", figsize=(9, 4.5), ylim=(0, 100), rot=35)
-    ax.set_ylabel("Patient-repeat rows (%)")
-    ax.set_xlabel("Correct diagnoses / observed diagnoses")
-    ax.set_title("Patient-level diagnosis accuracy by CV repeat")
-    ax.legend(title="CV repeat")
-    ax.figure.tight_layout()
-    ax.figure.savefig(distribution_figure, dpi=160)
-    plt.close(ax.figure)
-    return metrics, figure_path, distribution, distribution_figure
+
+def _multilabel_patient_detection(
+    children: list[Sweep], report_dir: Path
+) -> tuple[pd.DataFrame, pd.DataFrame, Path | None, Path | None]:
+    """Summarize detection of present labels and all-absent healthy controls."""
+    detection_frames: list[pd.DataFrame] = []
+    control_frames: list[pd.DataFrame] = []
+    for procedure, relative_path in (
+        ("MPMA-B selected single model", "predictions/mpma_b_outer_predictions.parquet"),
+        ("MPMA-E selected ensemble", "ensembling/ensemble_predictions.parquet"),
+    ):
+        truth_by_target: dict[str, pd.Series] = {}
+        prediction_by_target: dict[str, pd.Series] = {}
+        for child in children:
+            target = str(child.data.target_col)
+            frame = _read_table(Path(child.root()) / relative_path)
+            required = {"sample_id", "y_true", "y_pred"}
+            split_col = "outer_split_key" if "outer_split_key" in frame else "split_key"
+            if frame.empty or not required.issubset(frame.columns) or split_col not in frame:
+                continue
+            repeat_ids = frame[split_col].map(_regression_repeat_id)
+            keys = repeat_ids.astype(str) + "\0" + frame["sample_id"].astype(str)
+            y = pd.to_numeric(frame["y_true"], errors="coerce")
+            y_pred = pd.to_numeric(frame["y_pred"], errors="coerce")
+            valid = y.notna() & y_pred.notna()
+            series_key = pd.Index(keys[valid], name="prediction_unit")
+            if series_key.has_duplicates:
+                raise ValueError(
+                    f"{procedure} predictions contain duplicate sample/repeat rows for {target!r}."
+                )
+            truth_by_target[target] = pd.Series(
+                y[valid].to_numpy(dtype=int), index=series_key
+            )
+            prediction_by_target[target] = pd.Series(
+                y_pred[valid].to_numpy(dtype=int), index=series_key
+            )
+        if not truth_by_target:
+            continue
+
+        y_true = pd.concat(truth_by_target, axis=1).sort_index()
+        y_predicted = pd.concat(prediction_by_target, axis=1).reindex(
+            index=y_true.index, columns=y_true.columns
+        )
+        known = y_true.notna()
+        positive_target = str(children[0].data.positive_class)
+        class_labels = tuple(str(value) for value in children[0].data.class_labels)
+        if positive_target not in class_labels or len(class_labels) != 2:
+            raise ValueError(
+                "Patient-level positive-label summaries require binary class_labels "
+                "containing positive_class."
+            )
+        positive_value = class_labels.index(positive_target)
+        negative_value = next(i for i in range(2) if i != positive_value)
+        actual_present = y_true.eq(positive_value) & known
+        predicted_present = y_predicted.eq(positive_value)
+        n_present = actual_present.sum(axis=1).astype(int)
+        n_detected = (actual_present & predicted_present).sum(axis=1).astype(int)
+        repeat = pd.Series(
+            [str(key).split(chr(0), 1)[0] for key in y_true.index],
+            index=y_true.index,
+        )
+        patient_rows = pd.DataFrame(
+            {
+                "repeat": repeat,
+                "detected": n_detected,
+                "present": n_present,
+            }
+        )
+        patient_rows = patient_rows.loc[patient_rows["present"] > 0].copy()
+        patient_rows["category"] = (
+            patient_rows["detected"].astype(str)
+            + "/"
+            + patient_rows["present"].astype(str)
+            + " Present diagnoses detected"
+        )
+        if not patient_rows.empty:
+            counts = patient_rows.groupby(["category", "repeat"], observed=True).size()
+            totals = patient_rows.groupby("repeat").size()
+            for (category, repeat_id), count in counts.items():
+                detection_frames.append(
+                    pd.DataFrame([{
+                        "Prediction procedure": procedure,
+                        "CV repeat": repeat_id,
+                        "Present diagnoses detected / observed": category,
+                        "Patient-repeat rows": int(count),
+                        "Positive patients (%)": float(count / totals.loc[repeat_id] * 100),
+                    }])
+                )
+
+        confirmed_control = known.all(axis=1) & y_true.eq(negative_value).all(axis=1)
+        n_controls = int(confirmed_control.sum())
+        if n_controls:
+            correct_controls = (
+                y_predicted.loc[confirmed_control].eq(negative_value).all(axis=1)
+            )
+            repeat_control = repeat.loc[confirmed_control]
+            for repeat_id, indices in repeat_control.groupby(repeat_control).groups.items():
+                correct_count = int(correct_controls.loc[indices].sum())
+                total_count = int(len(indices))
+                control_frames.append(
+                    pd.DataFrame([{
+                        "Prediction procedure": procedure,
+                        "CV repeat": repeat_id,
+                        "Confirmed healthy controls": total_count,
+                        "All diagnoses predicted Absent": correct_count,
+                        "Healthy controls correctly identified (%)": float(
+                            correct_count / total_count * 100
+                        ),
+                    }])
+                )
+
+    detection = (
+        pd.concat(detection_frames, ignore_index=True)
+        if detection_frames else pd.DataFrame()
+    )
+    controls = (
+        pd.concat(control_frames, ignore_index=True)
+        if control_frames else pd.DataFrame()
+    )
+    figure_dir = report_dir / "figures"
+    figure_dir.mkdir(parents=True, exist_ok=True)
+    detection_figure = figure_dir / "multilabel_patient_positive_detection.png"
+    control_figure = figure_dir / "multilabel_healthy_control_exact_match.png"
+    if not detection.empty:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        plot = detection.pivot_table(
+            index="Present diagnoses detected / observed",
+            columns=["Prediction procedure", "CV repeat"],
+            values="Positive patients (%)",
+            fill_value=0,
+        )
+        ax = plot.plot(kind="bar", figsize=(11, 5), ylim=(0, 100), rot=35)
+        ax.set_ylabel("Positive patient-repeat rows (%)")
+        ax.set_xlabel("Present diagnoses correctly detected / observed Present diagnoses")
+        ax.set_title("Patient-level detection of Present diagnoses")
+        ax.legend(title="Procedure / CV repeat", bbox_to_anchor=(1.02, 1), loc="upper left")
+        ax.figure.tight_layout()
+        ax.figure.savefig(detection_figure, dpi=160, bbox_inches="tight")
+        plt.close(ax.figure)
+    else:
+        detection_figure = None
+    if not controls.empty:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        plot = controls.pivot_table(
+            index="Prediction procedure",
+            columns="CV repeat",
+            values="Healthy controls correctly identified (%)",
+            fill_value=0,
+        )
+        ax = plot.plot(kind="bar", figsize=(8, 4.5), ylim=(0, 100), rot=0)
+        ax.set_ylabel("Healthy controls with all diagnoses predicted Absent (%)")
+        ax.set_xlabel("")
+        ax.set_title("Exact identification of confirmed healthy controls")
+        ax.legend(title="CV repeat")
+        ax.figure.tight_layout()
+        ax.figure.savefig(control_figure, dpi=160)
+        plt.close(ax.figure)
+    else:
+        control_figure = None
+    return detection, controls, detection_figure, control_figure
 
 
 def write_multi_target_report(
@@ -1855,10 +1970,17 @@ def write_multi_target_report(
         macro = (
             _multilabel_summary(children) if task == "multilabel" else pd.DataFrame()
         )
-        joint_metrics, joint_figure, patient_accuracy, patient_accuracy_figure = (
+        (
+            joint_metrics,
+            joint_figure,
+            patient_detection,
+            patient_detection_figure,
+            healthy_control_accuracy,
+            healthy_control_figure,
+        ) = (
             _multilabel_oof_summary(children, report_dir)
             if task == "multilabel"
-            else (pd.DataFrame(), None, pd.DataFrame(), None)
+            else (pd.DataFrame(), None, pd.DataFrame(), None, pd.DataFrame(), None)
         )
 
         procedure = pd.DataFrame(
@@ -1909,14 +2031,25 @@ def write_multi_target_report(
             f'<img alt="Per-diagnosis held-out performance" style="max-width:100%;height:auto" '
             f'src="report/figures/{joint_figure.name}">'
         )
-        if not patient_accuracy.empty and patient_accuracy_figure:
+        if not patient_detection.empty and patient_detection_figure:
             joint_html += (
-                '<h3>Patient-level correctness distribution</h3>'
-                "<p>Counts are reported separately for each CV repeat. Each row is a patient-repeat prediction, "
-                "and unknown diagnosis labels are excluded from that patient's denominator.</p>"
-                f'{_report._html_table(patient_accuracy)}'
-                f'<img alt="Distribution of patient-level diagnosis accuracy" style="max-width:100%;height:auto" '
-                f'src="report/figures/{patient_accuracy_figure.name}">'
+                '<h3>Patient-level detection of Present diagnoses</h3>'
+                '<p>For each patient with at least one observed Present diagnosis, this shows how many of those '
+                'Present labels were predicted Present. Missing labels are excluded. MPMA-B uses the single '
+                'model selected within each outer fold; MPMA-E uses the ensemble selected within each outer fold, '
+                'with selection based on inner validation predictions.</p>'
+                f'{_report._html_table(patient_detection)}'
+                f'<img alt="Patient-level detection of Present diagnoses" style="max-width:100%;height:auto" '
+                f'src="report/figures/{patient_detection_figure.name}">'
+            )
+        if not healthy_control_accuracy.empty and healthy_control_figure:
+            joint_html += (
+                '<h3>Healthy control exact-match performance</h3>'
+                '<p>A confirmed healthy control has all diagnosis labels observed and every true label is Absent. '
+                'The table reports how many such patients each procedure predicted Absent for every diagnosis.</p>'
+                f'{_report._html_table(healthy_control_accuracy)}'
+                f'<img alt="Healthy control exact-match performance" style="max-width:100%;height:auto" '
+                f'src="report/figures/{healthy_control_figure.name}">'
             )
 
     html_text = f'''<!doctype html>
@@ -1972,7 +2105,9 @@ def write_multi_target_report(
 
     hardware_environment_path = tables_dir / "hardware_environment.parquet"
 
-    patient_accuracy_path = tables_dir / "multilabel_patient_accuracy.parquet"
+    patient_detection_path = tables_dir / "multilabel_patient_positive_detection.parquet"
+
+    healthy_control_path = tables_dir / "multilabel_healthy_control_exact_match.parquet"
 
     write_table(
         important_features_path,
@@ -1989,7 +2124,9 @@ def write_multi_target_report(
     )
 
     if task == "multilabel":
-        write_table(patient_accuracy_path, patient_accuracy)
+        write_table(patient_detection_path, patient_detection)
+
+        write_table(healthy_control_path, healthy_control_accuracy)
 
     manifest_path = report_dir / "report_manifest.json"
 
@@ -2017,8 +2154,10 @@ def write_multi_target_report(
         "important_features": important_features_path,
         "hardware_environment": hardware_environment_path,
     }
-    if task == "multilabel" and not patient_accuracy.empty:
-        outputs["patient_accuracy"] = patient_accuracy_path
+    if task == "multilabel" and not patient_detection.empty:
+        outputs["patient_positive_detection"] = patient_detection_path
+    if task == "multilabel" and not healthy_control_accuracy.empty:
+        outputs["healthy_control_exact_match"] = healthy_control_path
 
     stage("Combined run summary", str(root))
 
