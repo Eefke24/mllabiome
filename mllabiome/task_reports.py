@@ -1899,12 +1899,32 @@ def write_multi_target_report(
 
     css = _report._report_css()
 
+    joint_html = ""
+    if not joint_metrics.empty and joint_figure:
+        joint_html = (
+            '<h2>Joint multi-label performance</h2>'
+            '<p>Metrics use aligned held-out MPMA-B predictions. Missing diagnosis labels are omitted from cell-wise metrics; '
+            'exact match is calculated only for rows with every diagnosis observed.</p>'
+            f'{_report._html_table(joint_metrics)}'
+            f'<img alt="Per-diagnosis held-out performance" style="max-width:100%;height:auto" '
+            f'src="report/figures/{joint_figure.name}">'
+        )
+        if not patient_accuracy.empty and patient_accuracy_figure:
+            joint_html += (
+                '<h3>Patient-level correctness distribution</h3>'
+                "<p>Counts are reported separately for each CV repeat. Each row is a patient-repeat prediction, "
+                "and unknown diagnosis labels are excluded from that patient's denominator.</p>"
+                f'{_report._html_table(patient_accuracy)}'
+                f'<img alt="Distribution of patient-level diagnosis accuracy" style="max-width:100%;height:auto" '
+                f'src="report/figures/{patient_accuracy_figure.name}">'
+            )
+
     html_text = f'''<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>mllabiome report</title><link rel="icon" type="image/svg+xml" href="{_report._favicon_href()}"><style>{css}</style></head>
 <body>{_report._report_nav_html()}
 <div class="report-shell"><main id="top" class="report-content"><h2 id="performance-evaluation" class="first-section">Task definition and evaluation procedure</h2>{_report._procedure_grid_html(procedure)}
 <h2 id="performance-summary">Target performance overview</h2><p>Every target retains its task-appropriate primary metric. Values are mean ± SD across {"held-out datasets" if is_lodo_protocol(sweep.evaluation.protocol) else "outer test folds"}. Classification and regression metrics are intentionally not collapsed into a single heterogeneous score.</p>{_report._html_table(overview)}{_report._html_table(macro) if not macro.empty else ""}
-{f'<h2>Joint multi-label performance</h2><p>Metrics use aligned held-out MPMA-B predictions. Missing diagnosis labels are omitted from cell-wise metrics; exact match is calculated only for rows with every diagnosis observed.</p>{_report._html_table(joint_metrics)}<img alt="Per-diagnosis held-out performance" style="max-width:100%;height:auto" src="report/figures/{joint_figure.name}"><h3>Patient-level correctness distribution</h3><p>Counts are reported separately for each CV repeat. Each row is a patient-repeat prediction, and unknown diagnosis labels are excluded from that patient's denominator.</p>{_report._html_table(patient_accuracy)}<img alt="Distribution of patient-level diagnosis accuracy" style="max-width:100%;height:auto" src="report/figures/{patient_accuracy_figure.name}">' if not joint_metrics.empty and joint_figure and not patient_accuracy.empty and patient_accuracy_figure else ''}
+{joint_html}
 {sections}{_report._report_footer_html()}</main></div></body></html>'''
 
     html_text = _report._sanitize_report_html(html_text)
