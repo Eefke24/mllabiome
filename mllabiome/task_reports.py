@@ -1357,7 +1357,7 @@ def write_regression_report(sweep: Sweep, emit_html: bool = True) -> dict[str, P
 {robustness_html}
 <h2 id="compute">Computational resources</h2><p>Compute is summarized by additive CPU core-hours, model-fit count, and peak resident memory for the worker process tree. CPU time includes child processes and external R processes when used. MPMA-B and MPMA-E share the MPMA search pool, so their compute totals overlap.</p>{_report._html_table(compute_display)}
 <h4>Hardware and runtime environment</h4>{_report._html_table(hardware_summary) if not hardware_summary.empty else "<p>Hardware details are unavailable for this run.</p>"}
-
+{_report._abbreviations_html()}
 {_report._report_footer_html()}</main></div></body></html>'''
 
     html_text = _report._sanitize_report_html(html_text)
@@ -1677,15 +1677,19 @@ def _multilabel_summary(children: list[Sweep]) -> pd.DataFrame:
     return macro
 
 
-def _multilabel_oof_summary(children: list[Sweep], report_dir: Path) -> tuple[pd.DataFrame, Path | None]:
+def _multilabel_oof_summary(
+    children: list[Sweep], report_dir: Path
+) -> tuple[pd.DataFrame, Path | None, pd.DataFrame, Path | None]:
     """Compute joint metrics from each label's held-out predictions."""
     truth: dict[str, pd.Series] = {}
     scores: dict[str, pd.Series] = {}
+    predictions: dict[str, pd.Series] = {}
     per_label: list[dict[str, Any]] = []
     for child in children:
         target = str(child.data.target_col)
         frame = _read_table(Path(child.root()) / "predictions" / "mpma_b_outer_predictions.parquet")
-        if frame.empty or not {"outer_split_key", "sample_id", "y_true"}.issubset(frame.columns):
+        required = {"outer_split_key", "sample_id", "y_true", "y_pred"}
+        if frame.empty or not required.issubset(frame.columns):
             continue
         if "y_proba_pos" in frame.columns:
             probability = pd.to_numeric(frame["y_proba_pos"], errors="coerce")
@@ -1695,29 +1699,37 @@ def _multilabel_oof_summary(children: list[Sweep], report_dir: Path) -> tuple[pd
             if col not in frame.columns:
                 continue
             probability = pd.to_numeric(frame[col], errors="coerce")
-        keys = frame["outer_split_key"].astype(str) + "\0" + frame["sample_id"].astype(str)
+        repeat_ids = frame["outer_split_key"].map(_regression_repeat_id)
+        keys = repeat_ids.astype(str) + "\0" + frame["sample_id"].astype(str)
         y = pd.to_numeric(frame["y_true"], errors="coerce")
-        valid = y.notna() & probability.notna()
+        y_pred = pd.to_numeric(frame["y_pred"], errors="coerce")
+        valid = y.notna() & probability.notna() & y_pred.notna()
         series_key = pd.Index(keys[valid], name="prediction_unit")
+        if series_key.has_duplicates:
+            raise ValueError(
+                f"Multi-label predictions contain duplicate sample/repeat rows for {target!r}."
+            )
         truth[target] = pd.Series(y[valid].to_numpy(dtype=int), index=series_key)
         scores[target] = pd.Series(probability[valid].to_numpy(dtype=float), index=series_key)
+        predictions[target] = pd.Series(y_pred[valid].to_numpy(dtype=int), index=series_key)
         yt = truth[target].to_numpy(dtype=int)
         auc = roc_auc_score(yt, scores[target]) if len(np.unique(yt)) == 2 else np.nan
         ap = average_precision_score(yt, scores[target]) if len(np.unique(yt)) == 2 else np.nan
         per_label.append({"Target": target, "AUROC": auc, "Average precision": ap})
     if not truth:
-        return pd.DataFrame(), None
+        return pd.DataFrame(), None, pd.DataFrame(), None
 
     y_true = pd.concat(truth, axis=1).sort_index()
     y_score = pd.concat(scores, axis=1).reindex(index=y_true.index, columns=y_true.columns)
+    y_predicted = pd.concat(predictions, axis=1).reindex(index=y_true.index, columns=y_true.columns)
     known = y_true.notna()
     flat_true = y_true.to_numpy(dtype=float)[known.to_numpy()].astype(int)
     flat_score = y_score.to_numpy(dtype=float)[known.to_numpy()]
-    flat_pred = (flat_score >= 0.5).astype(int)
+    flat_pred = y_predicted.to_numpy(dtype=float)[known.to_numpy()].astype(int)
     fully_known = known.all(axis=1).to_numpy()
     exact_match = (
         accuracy_score(y_true.loc[fully_known].to_numpy(dtype=int),
-                       (y_score.loc[fully_known].to_numpy(dtype=float) >= 0.5).astype(int))
+                       y_predicted.loc[fully_known].to_numpy(dtype=int))
         if fully_known.any() else np.nan
     )
     auc_micro = roc_auc_score(flat_true, flat_score) if len(np.unique(flat_true)) == 2 else np.nan
@@ -1749,7 +1761,68 @@ def _multilabel_oof_summary(children: list[Sweep], report_dir: Path) -> tuple[pd
     ax.figure.tight_layout()
     ax.figure.savefig(figure_path, dpi=160)
     plt.close(ax.figure)
-    return metrics, figure_path
+
+    correct = y_true.eq(y_predicted).where(known)
+    observed_per_row = known.sum(axis=1).astype(int)
+    correct_per_row = correct.sum(axis=1).astype(int)
+    accuracy_rows = pd.DataFrame(
+        {
+            "repeat": [str(key).split(chr(0), 1)[0] for key in y_true.index],
+            "correct": correct_per_row.to_numpy(dtype=int),
+            "observed": observed_per_row.to_numpy(dtype=int),
+        }
+    )
+    accuracy_rows = accuracy_rows.loc[accuracy_rows["observed"] > 0].copy()
+    accuracy_rows["category"] = (
+        accuracy_rows["correct"].astype(str)
+        + "/"
+        + accuracy_rows["observed"].astype(str)
+        + " correct"
+    )
+    accuracy_rows["proportion"] = (
+        accuracy_rows["correct"] / accuracy_rows["observed"]
+    )
+    repeats = sorted(accuracy_rows["repeat"].unique())
+    categories = (
+        accuracy_rows[["category", "correct", "observed", "proportion"]]
+        .drop_duplicates()
+        .sort_values(["proportion", "observed"], ascending=[False, False])
+    )
+    count_table = (
+        accuracy_rows.groupby(["category", "repeat"], observed=True)
+        .size()
+        .unstack(fill_value=0)
+        .reindex(index=categories["category"], columns=repeats, fill_value=0)
+    )
+    total_per_repeat = accuracy_rows.groupby("repeat").size().reindex(repeats)
+    distribution = pd.DataFrame(
+        {
+            "Correct / observed": categories["category"].to_numpy(),
+            "Correct fraction": categories["proportion"].to_numpy(dtype=float),
+        }
+    )
+    plot_values: dict[str, np.ndarray] = {}
+    for repeat in repeats:
+        percentages = (
+            count_table[repeat].to_numpy(dtype=float)
+            / float(total_per_repeat.loc[repeat])
+            * 100.0
+        )
+        distribution[f"{repeat} patients"] = count_table[repeat].to_numpy(dtype=int)
+        distribution[f"{repeat} percent"] = percentages
+        plot_values[repeat] = percentages
+
+    distribution_figure = report_dir / "figures" / "multilabel_patient_accuracy.png"
+    plot_frame = pd.DataFrame(plot_values, index=categories["category"])
+    ax = plot_frame.plot(kind="bar", figsize=(9, 4.5), ylim=(0, 100), rot=35)
+    ax.set_ylabel("Patient-repeat rows (%)")
+    ax.set_xlabel("Correct diagnoses / observed diagnoses")
+    ax.set_title("Patient-level diagnosis accuracy by CV repeat")
+    ax.legend(title="CV repeat")
+    ax.figure.tight_layout()
+    ax.figure.savefig(distribution_figure, dpi=160)
+    plt.close(ax.figure)
+    return metrics, figure_path, distribution, distribution_figure
 
 
 def write_multi_target_report(
@@ -1782,9 +1855,10 @@ def write_multi_target_report(
         macro = (
             _multilabel_summary(children) if task == "multilabel" else pd.DataFrame()
         )
-        joint_metrics, joint_figure = (
+        joint_metrics, joint_figure, patient_accuracy, patient_accuracy_figure = (
             _multilabel_oof_summary(children, report_dir)
-            if task == "multilabel" else (pd.DataFrame(), None)
+            if task == "multilabel"
+            else (pd.DataFrame(), None, pd.DataFrame(), None)
         )
 
         procedure = pd.DataFrame(
@@ -1830,7 +1904,7 @@ def write_multi_target_report(
 <body>{_report._report_nav_html()}
 <div class="report-shell"><main id="top" class="report-content"><h2 id="performance-evaluation" class="first-section">Task definition and evaluation procedure</h2>{_report._procedure_grid_html(procedure)}
 <h2 id="performance-summary">Target performance overview</h2><p>Every target retains its task-appropriate primary metric. Values are mean ± SD across {"held-out datasets" if is_lodo_protocol(sweep.evaluation.protocol) else "outer test folds"}. Classification and regression metrics are intentionally not collapsed into a single heterogeneous score.</p>{_report._html_table(overview)}{_report._html_table(macro) if not macro.empty else ""}
-{f'<h2>Joint multi-label performance</h2><p>Metrics use aligned held-out MPMA-B predictions. Missing diagnosis labels are omitted from cell-wise metrics; exact match is calculated only for rows with every diagnosis observed.</p>{_report._html_table(joint_metrics)}<img alt="Per-diagnosis held-out performance" style="max-width:100%;height:auto" src="report/figures/{joint_figure.name}">' if not joint_metrics.empty and joint_figure else ''}
+{f'<h2>Joint multi-label performance</h2><p>Metrics use aligned held-out MPMA-B predictions. Missing diagnosis labels are omitted from cell-wise metrics; exact match is calculated only for rows with every diagnosis observed.</p>{_report._html_table(joint_metrics)}<img alt="Per-diagnosis held-out performance" style="max-width:100%;height:auto" src="report/figures/{joint_figure.name}"><h3>Patient-level correctness distribution</h3><p>Counts are reported separately for each CV repeat. Each row is a patient-repeat prediction, and unknown diagnosis labels are excluded from that patient's denominator.</p>{_report._html_table(patient_accuracy)}<img alt="Distribution of patient-level diagnosis accuracy" style="max-width:100%;height:auto" src="report/figures/{patient_accuracy_figure.name}">' if not joint_metrics.empty and joint_figure and not patient_accuracy.empty and patient_accuracy_figure else ''}
 {sections}{_report._report_footer_html()}</main></div></body></html>'''
 
     html_text = _report._sanitize_report_html(html_text)
@@ -1878,6 +1952,8 @@ def write_multi_target_report(
 
     hardware_environment_path = tables_dir / "hardware_environment.parquet"
 
+    patient_accuracy_path = tables_dir / "multilabel_patient_accuracy.parquet"
+
     write_table(
         important_features_path,
         pd.concat(important_frames, ignore_index=True)
@@ -1891,6 +1967,9 @@ def write_multi_target_report(
         if hardware_frames
         else pd.DataFrame(),
     )
+
+    if task == "multilabel":
+        write_table(patient_accuracy_path, patient_accuracy)
 
     manifest_path = report_dir / "report_manifest.json"
 
@@ -1918,6 +1997,8 @@ def write_multi_target_report(
         "important_features": important_features_path,
         "hardware_environment": hardware_environment_path,
     }
+    if task == "multilabel" and not patient_accuracy.empty:
+        outputs["patient_accuracy"] = patient_accuracy_path
 
     stage("Combined run summary", str(root))
 

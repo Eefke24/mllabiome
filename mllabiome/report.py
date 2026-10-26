@@ -456,6 +456,91 @@ def _display_learner(value: Any, learner_labels: dict[str, str] | None = None) -
     return _human_learner_name(text)
 
 
+_REPORT_ABBREVIATIONS = (
+    ("ALE", "accumulated local effects"),
+    ("ALR", "additive log-ratio"),
+    ("ANCOM-BC2", "Analysis of Compositions of Microbiomes with Bias Correction 2"),
+    ("AP", "average precision"),
+    ("AUCPR", "trapezoidal area under the precision-recall curve"),
+    ("AUROC", "area under the receiver operating characteristic curve"),
+    ("AutoML", "automated machine learning"),
+    ("CI", "confidence interval"),
+    ("CLR", "centered log-ratio"),
+    ("CPU", "central processing unit"),
+    ("CV", "cross-validation"),
+    ("ECDF", "empirical cumulative distribution function"),
+    ("F1", "harmonic mean of precision and recall"),
+    ("F1w", "support-weighted F1 score"),
+    ("FDR", "false discovery rate"),
+    ("FLAML", "Fast and Lightweight AutoML"),
+    ("FN", "false negative"),
+    ("FP", "false positive"),
+    ("GiB", "gibibyte"),
+    ("HC3", "heteroskedasticity-consistent covariance estimator, type 3"),
+    ("ID", "identifier"),
+    ("ILR", "isometric log-ratio"),
+    ("IQR", "interquartile range"),
+    ("LIME", "Local Interpretable Model-agnostic Explanations"),
+    ("LODO", "leave-one-dataset-out"),
+    ("MAE", "mean absolute error"),
+    ("MCC", "Matthews correlation coefficient"),
+    ("mdFDR", "mixed directional false discovery rate"),
+    ("ML", "machine learning"),
+    ("MPDR", "Microbiota profile data representation"),
+    ("MPMA", "Microbiota profile modelling algorithm"),
+    ("MPMA-B", "Microbiota profile modelling algorithm - base"),
+    ("MPMA-E", "Microbiota profile modelling algorithm - ensemble"),
+    ("MSE", "mean squared error"),
+    ("N", "number of evaluated observations"),
+    ("NA", "not available"),
+    ("NPV", "negative predictive value"),
+    ("OOF", "out-of-fold"),
+    ("OvR", "one-vs-rest"),
+    ("P/A", "presence/absence"),
+    ("PCoA", "principal coordinates analysis"),
+    ("PERMANOVA", "permutational multivariate analysis of variance"),
+    ("PERMDISP", "permutational analysis of multivariate dispersions"),
+    ("PPV", "positive predictive value"),
+    ("QN", "quantile normalization"),
+    ("Q1", "first quartile"),
+    ("Q3", "third quartile"),
+    ("RA", "relative abundance"),
+    ("RAM", "random-access memory"),
+    ("RF", "random forest"),
+    ("RMSE", "root mean squared error"),
+    ("ROC", "receiver operating characteristic"),
+    ("R²", "coefficient of determination"),
+    ("SD", "standard deviation"),
+    ("SHAP", "SHapley Additive exPlanations"),
+    (
+        "SIAMCAT",
+        "Statistical Inference of Associations between Microbial Communities And host phenoTypes",
+    ),
+    ("SMD", "standardized mean difference"),
+    ("TN", "true negative"),
+    ("TP", "true positive"),
+    ("YJ", "Yeo-Johnson"),
+    ("ε", "training-derived half-minimum positive relative-abundance pseudocount"),
+)
+
+
+def _abbreviations_html(heading_level: int = 2) -> str:
+    level = min(6, max(1, int(heading_level)))
+    rows = "".join(
+        "<tr>"
+        f"<td><strong>{html.escape(abbreviation)}</strong></td>"
+        f"<td>{html.escape(definition)}</td>"
+        "</tr>"
+        for abbreviation, definition in _REPORT_ABBREVIATIONS
+    )
+    return (
+        f'<h{level} id="abbreviations">Abbreviations</h{level}>'
+        '<div class="table-wrap"><table><thead><tr>'
+        "<th>Abbreviation or symbol</th><th>Meaning</th>"
+        f"</tr></thead><tbody>{rows}</tbody></table></div>"
+    )
+
+
 def _display_data_format(value: Any) -> str:
 
     text = str(value).strip()
