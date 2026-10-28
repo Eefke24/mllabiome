@@ -153,9 +153,13 @@ def split_signatures(
         raise ValueError(
             "Cross-validation split persistence requires unique sample IDs."
         )
-    target = np.asarray(y, dtype=object).reshape(-1)
-    if len(target) != len(ids):
+    target = np.asarray(y, dtype=object)
+    if target.ndim == 0 or target.shape[0] != len(ids):
         raise ValueError("Target length does not match the number of sample IDs.")
+    if target.ndim == 1:
+        target_values = [_json_value(value) for value in target.tolist()]
+    else:
+        target_values = [_json_value(row.tolist()) for row in target]
     group_values = _normalise_optional(groups, len(ids))
     stratum_values = _normalise_optional(strata, len(ids))
     subject_values = _normalise_optional(subject_ids, len(ids))
@@ -163,7 +167,7 @@ def split_signatures(
         records = sorted(
             (
                 ids[index],
-                _json_value(target[index]),
+                target_values[index],
                 group_values[index],
                 stratum_values[index],
                 subject_values[index],
@@ -174,7 +178,7 @@ def split_signatures(
         records = sorted(
             (
                 ids[index],
-                _json_value(target[index]),
+                target_values[index],
                 group_values[index],
                 stratum_values[index],
             )
