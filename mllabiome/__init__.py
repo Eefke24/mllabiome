@@ -24,6 +24,7 @@ from .configs_sweep import (
     evaluate,
 )
 from .data import Data, Dataset, Metadata, load_dataset
+from .fold_pca import FoldPCATargetSpec
 from .causilo import CausiloClassifier, CausiloDependencyError
 from .exaone import EXAONETabularClassifier, EXAONETabularDependencyError
 from .ensemble_sweep import sweep_ensemble
@@ -66,7 +67,7 @@ from .modalities import (
     Samples,
     load_modalities,
 )
-from .pipeline import run_all, run_explore, run_inference, run_robustness
+from .pipeline import run_all, run_explore, run_inference, run_report, run_robustness
 from .report import write_report
 from .resolutions import materialize_mpdr
 from .siamcat import SIAMCATClassifier
@@ -124,6 +125,7 @@ __all__ = [
     "Data",
     "Metadata",
     "Dataset",
+    "FoldPCATargetSpec",
     "Ensemble",
     "Evaluation",
     "Federated",
@@ -198,6 +200,7 @@ __all__ = [
     "run_all",
     "run_explore",
     "run_inference",
+    "run_report",
     "run_robustness",
     "sweep_ensemble",
     "transformation_label",

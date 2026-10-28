@@ -35,6 +35,7 @@ from .console import (
     EvaluationMonitor,
 )
 from .data import Dataset, dataset_fingerprint, load_dataset
+from .fold_pca import FoldPCASplitTargets, fit_fold_pca_targets
 from .estimator_protocol import EstimatorLike, is_estimator_instance
 from .figures import _write_representation_impact_figure
 from .learners import (
@@ -1584,7 +1585,7 @@ def _regression_prediction_rows(
     idx: np.ndarray,
     sample_ids: Sequence[str],
     subject_ids: Sequence[str],
-    y: np.ndarray,
+    y_eval: np.ndarray,
     pred: np.ndarray,
     stage_name: str,
     outer_split_key: str,
@@ -1602,7 +1603,7 @@ def _regression_prediction_rows(
                 "subject_id": str(subject_ids[i]),
                 "sample_index": i,
                 "config_id": cid,
-                "y_true": float(y[i]),
+                "y_true": float(y_eval[row_no]),
                 "y_pred": float(pred[row_no]),
                 "task": "regression",
                 "target": str(target_name),
@@ -1622,7 +1623,8 @@ def _fit_regression_split_fold(
     X_base: np.ndarray,
     feature_names: Sequence[str],
     feature_blocks: Any,
-    y: np.ndarray,
+    y_fit: np.ndarray,
+    y_eval: np.ndarray,
     sample_ids: Sequence[str],
     subject_ids: Sequence[str],
     target_name: str,
@@ -1642,6 +1644,7 @@ def _fit_regression_split_fold(
     gate_metric: str,
     random_state: int,
     threads_per_worker: int,
+    target_diagnostics: Mapping[str, Any] | None = None,
 ) -> _RegressionFoldOutput:
     fold_start = time.perf_counter_ns()
     X_fit, X_eval, feature_mask = _lodo_feature_pair(
@@ -1666,7 +1669,7 @@ def _fit_regression_split_fold(
     setup_end = time.perf_counter_ns()
     synchronize_accelerators()
     fit_start = time.perf_counter_ns()
-    estimator.fit(X_fit_transformed, y[fit_idx])
+    estimator.fit(X_fit_transformed, y_fit)
     synchronize_accelerators()
     fit_end = time.perf_counter_ns()
     pred = np.asarray(
@@ -1675,7 +1678,7 @@ def _fit_regression_split_fold(
     ).reshape(-1)
     synchronize_accelerators()
     predict_end = time.perf_counter_ns()
-    metrics = compute_regression_metrics(y[eval_idx], pred)
+    metrics = compute_regression_metrics(y_eval, pred)
     metric_row = _regression_metric_row(
         metrics,
         outer_split_key,
@@ -1686,6 +1689,9 @@ def _fit_regression_split_fold(
         stage_name,
     )
     metric_row.update(fitted.feature_filter_metadata())
+    if target_diagnostics:
+        metric_row.update(dict(target_diagnostics))
+        metric_row["pca_target_domain"] = str(target_name)
     metric_row.update(
         {
             "preprocess_seconds": (preprocess_end - fold_start) / 1e9,
@@ -1706,7 +1712,7 @@ def _fit_regression_split_fold(
         eval_idx,
         sample_ids,
         subject_ids,
-        y,
+        y_eval,
         pred,
         stage_name,
         outer_split_key,
@@ -1727,6 +1733,8 @@ def _evaluate_regression_inner_splits(
     feature_names: Sequence[str],
     feature_blocks: Any,
     y: np.ndarray,
+    fold_targets: Mapping[str, FoldPCASplitTargets] | None,
+    fold_target_index: int | None,
     sample_ids: Sequence[str],
     subject_ids: Sequence[str],
     target_name: str,
@@ -1754,12 +1762,24 @@ def _evaluate_regression_inner_splits(
         eval_idx = train_idx[np.asarray(inner_val_local, dtype=int)]
         if len(fit_idx) == 0 or len(eval_idx) == 0:
             continue
+        target_pair = None if fold_targets is None else fold_targets.get(inner_key)
+        if fold_target_index is not None:
+            if target_pair is None:
+                raise ValueError(f"Missing fold-local PCA targets for inner split {inner_key!r}.")
+            y_fit = target_pair.train_scores[:, fold_target_index]
+            y_eval = target_pair.eval_scores[:, fold_target_index]
+            target_diagnostics = target_pair.diagnostics
+        else:
+            y_fit = y[fit_idx]
+            y_eval = y[eval_idx]
+            target_diagnostics = None
         try:
             output = _fit_regression_split_fold(
                 X_base,
                 feature_names,
                 feature_blocks,
-                y,
+                y_fit,
+                y_eval,
                 sample_ids,
                 subject_ids,
                 target_name,
@@ -1779,6 +1799,7 @@ def _evaluate_regression_inner_splits(
                 gate_metric,
                 random_state,
                 threads_per_worker,
+                target_diagnostics=target_diagnostics,
             )
             result["inner_metrics"].append(output.metric_row)
             result["inner_predictions"].extend(output.prediction_rows)
@@ -1861,6 +1882,8 @@ def _evaluate_regression_outer_split(
     feature_names: Sequence[str],
     feature_blocks: Any,
     y: np.ndarray,
+    fold_targets: Mapping[str, FoldPCASplitTargets] | None,
+    fold_target_index: int | None,
     sample_ids: Sequence[str],
     subject_ids: Sequence[str],
     target_name: str,
@@ -1879,11 +1902,23 @@ def _evaluate_regression_outer_split(
     threads_per_worker: int,
 ) -> None:
     try:
+        target_pair = None if fold_targets is None else fold_targets.get(split_key)
+        if fold_target_index is not None:
+            if target_pair is None:
+                raise ValueError(f"Missing fold-local PCA targets for outer split {split_key!r}.")
+            y_fit = target_pair.train_scores[:, fold_target_index]
+            y_eval = target_pair.eval_scores[:, fold_target_index]
+            target_diagnostics = target_pair.diagnostics
+        else:
+            y_fit = y[train_idx]
+            y_eval = y[test_idx]
+            target_diagnostics = None
         output = _fit_regression_split_fold(
             X_base,
             feature_names,
             feature_blocks,
-            y,
+            y_fit,
+            y_eval,
             sample_ids,
             subject_ids,
             target_name,
@@ -1903,6 +1938,7 @@ def _evaluate_regression_outer_split(
             gate_metric,
             random_state,
             threads_per_worker,
+            target_diagnostics=target_diagnostics,
         )
         result["outer_metrics"].append(output.metric_row)
         result["outer_predictions"].extend(output.prediction_rows)
@@ -1926,6 +1962,8 @@ def _evaluate_regression_split_task(
     feature_names: Sequence[str],
     feature_blocks: Any,
     y: np.ndarray,
+    fold_targets: Mapping[str, FoldPCASplitTargets] | None,
+    fold_target_index: int | None,
     sample_ids: Sequence[str],
     subject_ids: Sequence[str],
     target_name: str,
@@ -1985,6 +2023,8 @@ def _evaluate_regression_split_task(
             feature_names=feature_names,
             feature_blocks=feature_blocks,
             y=y,
+            fold_targets=fold_targets,
+            fold_target_index=fold_target_index,
             sample_ids=sample_ids,
             subject_ids=subject_ids,
             target_name=target_name,
@@ -2026,6 +2066,8 @@ def _evaluate_regression_split_task(
                 feature_names=feature_names,
                 feature_blocks=feature_blocks,
                 y=y,
+                fold_targets=fold_targets,
+                fold_target_index=fold_target_index,
                 sample_ids=sample_ids,
                 subject_ids=subject_ids,
                 target_name=target_name,
@@ -2147,6 +2189,7 @@ class _SweepEvaluationContext:
     current_config_ids: set[str]
     inner_done: set[tuple[str, str]]
     outer_done: set[tuple[str, str]]
+    fold_targets: dict[str, FoldPCASplitTargets]
     qualification_map: _QualificationMap
 
 
@@ -2626,6 +2669,32 @@ def _prepare_regression_evaluation(sweep: Sweep) -> _SweepEvaluationContext:
         groups,
         group_col=sweep.data.group_col,
     )
+    fold_targets: dict[str, FoldPCASplitTargets] = {}
+    if dataset.fold_pca_target is not None:
+        if dataset.fold_pca_reference_loadings is None:
+            raise ValueError("Fold PCA regression is missing its reference loading matrix.")
+        for outer in outer_splits:
+            split_key = str(outer["split_key"])
+            train_idx = np.asarray(outer["train_idx"], dtype=int)
+            test_idx = np.asarray(outer["test_idx"], dtype=int)
+            fold_targets[split_key] = fit_fold_pca_targets(
+                dataset.y[train_idx],
+                dataset.y[test_idx],
+                dataset.fold_pca_reference_loadings,
+                dataset.fold_pca_target,
+            )
+            for inner_no, (inner_train_local, inner_val_local) in enumerate(
+                inner_splits_by_outer.get(split_key, ())
+            ):
+                fit_idx = train_idx[np.asarray(inner_train_local, dtype=int)]
+                eval_idx = train_idx[np.asarray(inner_val_local, dtype=int)]
+                inner_key = f"{split_key}__i{inner_no}"
+                fold_targets[inner_key] = fit_fold_pca_targets(
+                    dataset.y[fit_idx],
+                    dataset.y[eval_idx],
+                    dataset.fold_pca_reference_loadings,
+                    dataset.fold_pca_target,
+                )
     _write_manifest(
         root,
         sweep,
@@ -2679,6 +2748,7 @@ def _prepare_regression_evaluation(sweep: Sweep) -> _SweepEvaluationContext:
         current_config_ids=current_config_ids,
         inner_done=_done_pairs(existing["inner_metrics"], "inner_key"),
         outer_done=_done_pairs(existing["outer_metrics"], "split_key"),
+        fold_targets=fold_targets,
         qualification_map=(
             _qualification_map(existing["qualification"]) if sweep.gate.enabled else {}
         ),
@@ -2818,6 +2888,7 @@ def _prepare_classification_evaluation(sweep: Sweep) -> _SweepEvaluationContext:
         current_config_ids=current_config_ids,
         inner_done=_done_pairs(existing["inner_metrics"], "inner_key"),
         outer_done=_done_pairs(existing["outer_metrics"], "split_key"),
+        fold_targets={},
         qualification_map=(
             _qualification_map(existing["qualification"]) if sweep.gate.enabled else {}
         ),
@@ -2892,6 +2963,12 @@ def _build_regression_tasks(
                         feature_names,
                         feature_blocks,
                         dataset.y,
+                        context.fold_targets,
+                        (
+                            dataset.fold_pca_target.domain_index(dataset.target_name)
+                            if dataset.fold_pca_target is not None
+                            else None
+                        ),
                         tuple(dataset.sample_ids),
                         tuple(dataset.subject_ids),
                         dataset.target_name,
@@ -3065,13 +3142,18 @@ def _show_regression_evaluation_overview(
 ) -> None:
     stage("Regression configuration sweep", sweep.title)
     y = np.asarray(context.dataset.y, dtype=float)
+    target_range = (
+        "fold-local PCA scores"
+        if context.dataset.fold_pca_target is not None
+        else f"{float(np.min(y)):.4g} to {float(np.max(y)):.4g}"
+    )
     summary_table(
         "Sweep overview",
         {
             "task": "regression",
             "target": context.dataset.target_name,
             "samples": f"{len(y):,}",
-            "target range": f"{float(np.min(y)):.4g} to {float(np.max(y)):.4g}",
+            "target range": target_range,
             "MPDRs": f"{context.configs['mpdr_id'].nunique():,}",
             "MPMAs": f"{len(context.configs):,}",
             "protocol": sweep.evaluation.protocol,

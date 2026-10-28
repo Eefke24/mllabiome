@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 
 from .utils import TAXONOMIC_LEVELS
+from .fold_pca import FoldPCATargetSpec, load_reference_loadings
 
 
 @dataclass(frozen=True)
@@ -124,6 +125,7 @@ class Data:
     target_class_labels: Mapping[str, tuple[str, ...]] | None = None
     target_positive_classes: Mapping[str, int | str] | None = None
     drop_missing_target: bool = False
+    fold_pca_target: FoldPCATargetSpec | None = None
 
     def __post_init__(self) -> None:
         if self.metadata is not None and not isinstance(self.metadata, Metadata):
@@ -132,6 +134,10 @@ class Data:
             raise ValueError(
                 "Use Data.metadata=Metadata(...) or legacy Data.metadata_path=..., not both."
             )
+        if self.fold_pca_target is not None and not isinstance(
+            self.fold_pca_target, FoldPCATargetSpec
+        ):
+            raise TypeError("Data.fold_pca_target must be a FoldPCATargetSpec.")
 
 
 def metadata_spec(spec: Data) -> Metadata | None:
@@ -178,6 +184,8 @@ class Dataset:
     positive_class: int | None
     task: str = "classification"
     target_name: str = "label"
+    fold_pca_target: FoldPCATargetSpec | None = None
+    fold_pca_reference_loadings: np.ndarray | None = None
 
     @property
     def classes(self) -> np.ndarray:
@@ -224,6 +232,18 @@ def dataset_fingerprint(dataset: Dataset) -> str:
     else:
         _hash_array(hasher, dataset.y, "<f8")
     _hash_array(hasher, dataset.X_by_level["all"], "<f4")
+    if dataset.fold_pca_target is not None:
+        spec = dataset.fold_pca_target
+        _hash_text_sequence(hasher, spec.questionnaire_columns)
+        _hash_text_sequence(hasher, spec.reference_components)
+        _hash_text_sequence(hasher, spec.domains)
+        _hash_text(hasher, spec.n_components)
+        _hash_text(hasher, spec.promax_power)
+        _hash_text(hasher, spec.min_alignment_congruence)
+        _hash_text(hasher, spec.reference_n)
+        if dataset.fold_pca_reference_loadings is None:
+            raise ValueError("Fold PCA dataset is missing its reference loadings.")
+        _hash_array(hasher, dataset.fold_pca_reference_loadings, "<f8")
     return hasher.hexdigest()
 
 
@@ -263,6 +283,37 @@ def _encode_regression(values: Sequence[Any]) -> np.ndarray:
     if len(y) < 2:
         raise ValueError("Regression requires at least two samples.")
     return y
+
+
+def _fold_pca_target_data(
+    spec: Data, meta: pd.DataFrame, target_name: str
+) -> tuple[np.ndarray, np.ndarray] | None:
+    pca_spec = spec.fold_pca_target
+    if pca_spec is None:
+        return None
+    if str(target_name) not in pca_spec.domains:
+        raise ValueError(
+            f"Fold PCA target {target_name!r} is not declared in the domain mapping {pca_spec.domains!r}."
+        )
+    missing = [column for column in pca_spec.questionnaire_columns if column not in meta.columns]
+    if missing:
+        raise ValueError(f"Metadata is missing fold PCA questionnaire columns: {missing!r}.")
+    raw = meta.loc[:, list(pca_spec.questionnaire_columns)].apply(
+        pd.to_numeric, errors="coerce"
+    )
+    values = raw.to_numpy(dtype=float)
+    if not np.isfinite(values).all():
+        bad_rows = np.flatnonzero(~np.isfinite(values).all(axis=1)).tolist()
+        raise ValueError(
+            "Fold PCA questionnaire data must be complete and numeric; "
+            f"invalid row indices (first five): {bad_rows[:5]!r}."
+        )
+    reference = load_reference_loadings(
+        pca_spec.reference_loadings_path,
+        pca_spec.questionnaire_columns,
+        pca_spec.reference_components,
+    )
+    return values, reference
 
 
 def load_dataset(spec: Data, levels_needed: Iterable[str] | None = None) -> Dataset:
@@ -663,9 +714,9 @@ def _load_csv_dataset(spec: Data, levels_needed: tuple[str, ...]) -> Dataset:
         df = df.merge(meta, on=spec.sample_id_col, how="inner", suffixes=("", "__meta"))
     _validate_declared_metadata(spec, df)
     target_col = _single_target_name(spec)
-    if target_col not in df.columns:
+    if target_col not in df.columns and spec.fold_pca_target is None:
         raise ValueError(f"Target column {target_col!r} not found.")
-    if spec.drop_missing_target:
+    if spec.drop_missing_target and spec.fold_pca_target is None:
         df = df.loc[~_target_missing_mask(df[target_col])].copy()
         if df.empty:
             raise ValueError(f"Target column {target_col!r} has no observed labels.")
@@ -681,7 +732,12 @@ def _load_csv_dataset(spec: Data, levels_needed: tuple[str, ...]) -> Dataset:
         sample_ids = [str(i) for i in range(len(df))]
     subject_ids = _subject_ids(spec, df, sample_ids)
     task = _normalise_task(spec.task)
-    if task == "regression":
+    fold_target_data = _fold_pca_target_data(spec, df, target_col)
+    if fold_target_data is not None:
+        y, reference_loadings = fold_target_data
+        class_labels = []
+        positive_class = None
+    elif task == "regression":
         y = _encode_regression(df[target_col].tolist())
         class_labels = []
         positive_class = None
@@ -711,6 +767,10 @@ def _load_csv_dataset(spec: Data, levels_needed: tuple[str, ...]) -> Dataset:
         levels_needed,
         task,
         target_col,
+        fold_pca_target=spec.fold_pca_target,
+        fold_pca_reference_loadings=(
+            None if fold_target_data is None else fold_target_data[1]
+        ),
     )
 
 
@@ -806,9 +866,9 @@ def _load_matrix_tsv_dataset(spec: Data, levels_needed: tuple[str, ...]) -> Data
         raise ValueError(f"Metadata missing sample ID column {spec.sample_id_col!r}.")
     _validate_declared_metadata(spec, meta)
     target_col = _single_target_name(spec)
-    if target_col not in meta.columns:
+    if target_col not in meta.columns and spec.fold_pca_target is None:
         raise ValueError(f"Metadata missing target column {target_col!r}.")
-    if spec.drop_missing_target:
+    if spec.drop_missing_target and spec.fold_pca_target is None:
         meta = meta.loc[~_target_missing_mask(meta[target_col])].copy()
         if meta.empty:
             raise ValueError(f"Target column {target_col!r} has no observed labels.")
@@ -824,7 +884,12 @@ def _load_matrix_tsv_dataset(spec: Data, levels_needed: tuple[str, ...]) -> Data
     )
     meta = meta.set_index(spec.sample_id_col).loc[selected_sample_ids].reset_index()
     task = _normalise_task(spec.task)
-    if task == "regression":
+    fold_target_data = _fold_pca_target_data(spec, meta, target_col)
+    if fold_target_data is not None:
+        y, reference_loadings = fold_target_data
+        class_labels = []
+        positive_class = None
+    elif task == "regression":
         y = _encode_regression(meta[target_col].tolist())
         class_labels = []
         positive_class = None
@@ -850,6 +915,10 @@ def _load_matrix_tsv_dataset(spec: Data, levels_needed: tuple[str, ...]) -> Data
         levels_needed,
         task,
         target_col,
+        fold_pca_target=spec.fold_pca_target,
+        fold_pca_reference_loadings=(
+            None if fold_target_data is None else fold_target_data[1]
+        ),
     )
 
 
@@ -865,6 +934,8 @@ def _dataset_from_feature_matrix(
     levels_needed: tuple[str, ...],
     task: str = "classification",
     target_name: str = "label",
+    fold_pca_target: FoldPCATargetSpec | None = None,
+    fold_pca_reference_loadings: np.ndarray | None = None,
 ) -> Dataset:
     X_all = np.asarray(X_all, dtype=np.float32)
     if X_all.ndim != 2:
@@ -913,6 +984,8 @@ def _dataset_from_feature_matrix(
         positive_class=positive_class,
         task=task,
         target_name=target_name,
+        fold_pca_target=fold_pca_target,
+        fold_pca_reference_loadings=fold_pca_reference_loadings,
     )
 
 

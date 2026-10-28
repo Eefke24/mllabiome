@@ -106,7 +106,14 @@ def target_sweeps(sweep: Sweep) -> list[Sweep]:
             positive = sweep.data.target_positive_classes[target]
         extra_metadata = tuple(
             dict.fromkeys(
-                (*sweep.data.metadata_cols, *[x for x in targets if x != target])
+                (
+                    *sweep.data.metadata_cols,
+                    *(
+                        [x for x in targets if x != target]
+                        if sweep.data.fold_pca_target is None
+                        else []
+                    ),
+                )
             )
         )
         child_data = replace(

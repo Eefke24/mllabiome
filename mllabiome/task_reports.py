@@ -932,6 +932,12 @@ def _regression_procedure(sweep: Sweep, root: Path) -> pd.DataFrame:
         ["Samples", str(manifest.get("n_samples", ""))],
     ]
 
+    fold_pca_target = getattr(sweep.data, "fold_pca_target", None)
+    if fold_pca_target is not None:
+        rows.append(
+            ["Target construction", _fold_pca_target_description(fold_pca_target)]
+        )
+
     if getattr(sweep, "uses_modalities", False):
         rows.extend(
             [
@@ -976,6 +982,228 @@ def _regression_procedure(sweep: Sweep, root: Path) -> pd.DataFrame:
     )
 
     return pd.DataFrame(rows, columns=["Field", "Value"])
+
+
+def _fold_pca_target_description(spec: Any) -> str:
+    mapping = "; ".join(
+        f"{str(domain).replace('_', ' ')} = {component}"
+        for domain, component in spec.domain_to_component
+    )
+    n_questionnaires = len(spec.questionnaire_columns)
+    reference_size = (
+        f"the independent {int(spec.reference_n)}-participant reference cohort"
+        if spec.reference_n is not None
+        else "the independent reference cohort"
+    )
+    return (
+        f"For each inner and outer split, fit {int(spec.n_components)}-component PCA "
+        f"to the {n_questionnaires} questionnaire subscales using that split's training "
+        "participants only. Standardize with training-fold means and SDs, apply "
+        f"Promax rotation (power {int(spec.promax_power)}), and calculate regression "
+        "factor scores for both training and held-out participants with the fitted "
+        f"fold transform. Match and orient fold components to {reference_size} "
+        "loadings by maximum absolute Tucker congruence. Reference mapping: "
+        f"{mapping}. The four domain scores are fitted as separate regression targets."
+    )
+
+
+def _pca_alignment_stability_table(children: list[Sweep]) -> pd.DataFrame:
+    """Summarize selected MPMA-B fold PCA alignment diagnostics by domain."""
+    rows: list[dict[str, Any]] = []
+    for child in children:
+        spec = getattr(child.data, "fold_pca_target", None)
+        if spec is None:
+            continue
+        target = str(child.data.target_col)
+        component = spec.reference_components[spec.domain_index(target)]
+        root = Path(child.root())
+        raw = _read_table(root / "results" / "outer_results.parquet")
+        selected = _read_table(root / "tables" / "mpma_b_outer_selection.parquet")
+        congruence_column = f"pca_congruence_{component}"
+        if raw.empty or selected.empty or congruence_column not in raw.columns:
+            continue
+        if not {"split_key", "config_id"}.issubset(raw.columns):
+            continue
+        if not {"outer_split_key", "config_id"}.issubset(selected.columns):
+            continue
+
+        chosen = selected[["outer_split_key", "config_id"]].copy()
+        chosen["outer_split_key"] = chosen["outer_split_key"].astype(str)
+        chosen["config_id"] = chosen["config_id"].astype(str)
+        raw = raw.copy()
+        raw["split_key"] = raw["split_key"].astype(str)
+        raw["config_id"] = raw["config_id"].astype(str)
+        fold_rows = raw.merge(
+            chosen,
+            left_on=["split_key", "config_id"],
+            right_on=["outer_split_key", "config_id"],
+            how="inner",
+            validate="one_to_one",
+        )
+        if fold_rows.empty:
+            continue
+
+        values = pd.to_numeric(fold_rows[congruence_column], errors="coerce")
+        valid = values.notna() & np.isfinite(values.to_numpy(dtype=float))
+        fold_rows = fold_rows.loc[valid].copy()
+        values = values.loc[valid].to_numpy(dtype=float)
+        if len(values) == 0:
+            continue
+
+        match_column = f"pca_matched_fold_component_{component}"
+        match_values = (
+            pd.to_numeric(fold_rows[match_column], errors="coerce").dropna()
+            if match_column in fold_rows.columns
+            else pd.Series(dtype=float)
+        )
+        sign_column = f"pca_sign_applied_{component}"
+        sign_flips = (
+            int(pd.to_numeric(fold_rows[sign_column], errors="coerce").fillna(0).sum())
+            if sign_column in fold_rows.columns
+            else 0
+        )
+        match_mode = (
+            int(match_values.mode().iloc[0]) if not match_values.empty else np.nan
+        )
+        match_consistency = (
+            float((match_values == match_mode).mean() * 100.0)
+            if not match_values.empty and pd.notna(match_mode)
+            else np.nan
+        )
+        rows.append(
+            {
+                "Domain": target.replace("_", " "),
+                "Reference component": component,
+                "Outer folds": int(len(values)),
+                "Mean absolute congruence": float(np.mean(values)),
+                "SD absolute congruence": float(np.std(values, ddof=1))
+                if len(values) > 1
+                else 0.0,
+                "Minimum absolute congruence": float(np.min(values)),
+                "Folds at or above threshold (%)": float(
+                    np.mean(values >= float(spec.min_alignment_congruence)) * 100.0
+                ),
+                "Threshold": float(spec.min_alignment_congruence),
+                "Most common matched fold component": match_mode,
+                "Match consistency (%)": match_consistency,
+                "Fold sign adjustments": sign_flips,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _pca_example_subject_predictions(
+    children: list[Sweep], subject_id: str = "SYN0001"
+) -> pd.DataFrame:
+    """Collect MPMA-B held-out scores for a subject, averaged across CV repeats."""
+    records: list[dict[str, Any]] = []
+    for child in children:
+        target = str(child.data.target_col)
+        root = Path(child.root())
+        frame = _read_table(root / "predictions" / "mpma_b_outer_predictions.parquet")
+        required = {"sample_id", "outer_split_key", "y_true", "y_pred"}
+        if frame.empty or not required.issubset(frame.columns):
+            continue
+        sample_match = frame["sample_id"].astype(str) == str(subject_id)
+        if not sample_match.any() and "subject_id" in frame.columns:
+            sample_match = frame["subject_id"].astype(str) == str(subject_id)
+        frame = frame.loc[sample_match].copy()
+        if frame.empty:
+            continue
+        frame["repeat"] = frame["outer_split_key"].map(_regression_repeat_id)
+        frame["y_true"] = pd.to_numeric(frame["y_true"], errors="coerce")
+        frame["y_pred"] = pd.to_numeric(frame["y_pred"], errors="coerce")
+        frame = frame.dropna(subset=["y_true", "y_pred"])
+        if frame.empty:
+            continue
+        per_repeat = frame.groupby("repeat", as_index=False).agg(
+            true_score=("y_true", "mean"), predicted_score=("y_pred", "mean")
+        )
+        for row in per_repeat.to_dict(orient="records"):
+            records.append(
+                {
+                    "Subject": str(subject_id),
+                    "Domain": target,
+                    "Repeat": str(row["repeat"]),
+                    "True score": float(row["true_score"]),
+                    "Predicted score": float(row["predicted_score"]),
+                }
+            )
+    per_repeat = pd.DataFrame(records)
+    if per_repeat.empty:
+        return per_repeat
+    summary = (
+        per_repeat.groupby(["Subject", "Domain"], as_index=False)
+        .agg(
+            True_score=("True score", "mean"),
+            Predicted_score=("Predicted score", "mean"),
+            Repeats=("Repeat", "nunique"),
+        )
+        .rename(
+            columns={
+                "True_score": "Mean true score",
+                "Predicted_score": "Mean predicted score",
+            }
+        )
+    )
+    repeat_counts = per_repeat.groupby("Domain")["Repeat"].nunique()
+    summary["Repeat count"] = summary["Domain"].map(repeat_counts).astype(int)
+    return summary
+
+
+def _write_pca_example_radar(
+    summary: pd.DataFrame, report_dir: Path, domain_order: list[str]
+) -> Path | None:
+    if summary.empty or not set(domain_order).issubset(set(summary["Domain"].astype(str))):
+        return None
+    ordered = summary.set_index("Domain").loc[domain_order]
+    labels = [target.replace("_", " ") for target in domain_order]
+    truth = ordered["Mean true score"].to_numpy(dtype=float)
+    prediction = ordered["Mean predicted score"].to_numpy(dtype=float)
+    lower = min(0.0, float(np.min(np.r_[truth, prediction])))
+    upper = max(0.0, float(np.max(np.r_[truth, prediction])))
+    if not np.isfinite([lower, upper]).all() or upper <= lower:
+        return None
+    offset = lower
+    radial_truth = truth - offset
+    radial_prediction = prediction - offset
+    angles = np.linspace(0.0, 2.0 * np.pi, len(labels), endpoint=False)
+    closed_angles = np.r_[angles, angles[0]]
+    truth_closed = np.r_[radial_truth, radial_truth[0]]
+    prediction_closed = np.r_[radial_prediction, radial_prediction[0]]
+
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    figure_dir = report_dir / "figures"
+    figure_dir.mkdir(parents=True, exist_ok=True)
+    figure_path = figure_dir / "pca_example_subject_radar.png"
+    fig, ax = plt.subplots(figsize=(7.5, 6.5), subplot_kw={"projection": "polar"})
+    ax.plot(closed_angles, truth_closed, marker="o", linewidth=2, label="True score")
+    ax.fill(closed_angles, truth_closed, alpha=0.12)
+    ax.plot(
+        closed_angles,
+        prediction_closed,
+        marker="o",
+        linewidth=2,
+        label="MPMA-B predicted score",
+    )
+    ax.fill(closed_angles, prediction_closed, alpha=0.10)
+    ax.set_xticks(angles, labels)
+    tick_values = np.linspace(lower, upper, 5)
+    tick_values = np.unique(np.round(tick_values, 3))
+    tick_values = tick_values[tick_values >= lower]
+    ax.set_yticks(tick_values - offset, [f"{value:.2f}" for value in tick_values])
+    ax.set_ylim(0.0, upper - offset)
+    ax.set_rlabel_position(22.5)
+    ax.set_title("SYN0001: held-out domain scores, averaged across repeats", pad=24)
+    ax.legend(loc="upper right", bbox_to_anchor=(1.3, 1.12))
+    fig.tight_layout()
+    fig.savefig(figure_path, dpi=170, bbox_inches="tight")
+    plt.close(fig)
+    return figure_path
 
 
 def _regression_outer_unit_table(root: Path) -> pd.DataFrame:
@@ -1966,6 +2194,17 @@ def write_multi_target_report(
         phase.phase("task summaries")
 
         task = _normalise_sweep_task(sweep.data.task)
+        combined_task_label = (
+            "Multilabel"
+            if task == "multilabel"
+            else "Multi-target regression"
+            if children
+            and all(
+                _target_task(child.data, str(child.data.target_col)) == "regression"
+                for child in children
+            )
+            else "Heterogeneous multi-output"
+        )
 
         macro = (
             _multilabel_summary(children) if task == "multilabel" else pd.DataFrame()
@@ -1982,15 +2221,21 @@ def write_multi_target_report(
             if task == "multilabel"
             else (pd.DataFrame(), None, pd.DataFrame(), None, pd.DataFrame(), None)
         )
+        pca_stability = _pca_alignment_stability_table(children)
+        pca_example = _pca_example_subject_predictions(children, "SYN0001")
+        pca_spec = getattr(sweep.data, "fold_pca_target", None)
+        pca_example_figure = (
+            _write_pca_example_radar(pca_example, report_dir, list(pca_spec.domains))
+            if pca_spec is not None
+            else None
+        )
 
         procedure = pd.DataFrame(
             [
                 ["Task", sweep.title],
                 [
                     "Task type",
-                    "Multilabel"
-                    if task == "multilabel"
-                    else "Heterogeneous multi-output",
+                    combined_task_label,
                 ],
                 [
                     "Targets",
@@ -2011,6 +2256,11 @@ def write_multi_target_report(
             ],
             columns=["Field", "Value"],
         )
+        if pca_spec is not None:
+            procedure.loc[len(procedure)] = [
+                "Target construction",
+                _fold_pca_target_description(pca_spec),
+            ]
 
         phase.phase("target report sections")
 
@@ -2052,11 +2302,47 @@ def write_multi_target_report(
                 f'src="report/figures/{healthy_control_figure.name}">'
             )
 
+    pca_html = ""
+    if pca_spec is not None:
+        if not pca_stability.empty:
+            pca_html += (
+                '<h2 id="pca-alignment-stability">PCA alignment and stability</h2>'
+                '<p>Each row summarizes the selected MPMA-B component match across outer folds. '
+                'Absolute Tucker congruence measures loading-pattern similarity to the corresponding '
+                'reference component; values at or above the configured threshold indicate adequate '
+                'alignment. Match consistency reports how often the same pre-alignment fold component '
+                'was assigned to that reference component; component numbers are fold-local bookkeeping, '
+                'so congruence is the primary stability measure. Sign adjustments orient fold scores to '
+                'the reference direction.</p>'
+                f'{_report._html_table(pca_stability)}'
+            )
+        else:
+            pca_html += (
+                '<h2 id="pca-alignment-stability">PCA alignment and stability</h2>'
+                '<p>Alignment diagnostics will appear here after selected outer-fold results are available.</p>'
+            )
+        if pca_example_figure is not None:
+            pca_html += (
+                '<h2 id="pca-example-subject">Example subject scores</h2>'
+                '<p>The radar plot shows SYN0001’s true fold-specific scores and selected MPMA-B '
+                'predictions for each domain. Values are averaged over the subject’s held-out appearances '
+                'across CV repeats; true scores are generated by the PCA fitted on each corresponding '
+                'outer-training fold. The radial axis is shifted uniformly for display; tick labels show '
+                'the original score values.</p>'
+                f'<img alt="SYN0001 true and predicted PCA domain scores" style="max-width:100%;height:auto" '
+                f'src="report/figures/{pca_example_figure.name}">'
+            )
+        else:
+            pca_html += (
+                '<h2 id="pca-example-subject">Example subject scores</h2>'
+                '<p>The SYN0001 radar plot will appear after MPMA-B held-out predictions are available for all four domains.</p>'
+            )
     html_text = f'''<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>mllabiome report</title><link rel="icon" type="image/svg+xml" href="{_report._favicon_href()}"><style>{css}</style></head>
 <body>{_report._report_nav_html()}
 <div class="report-shell"><main id="top" class="report-content"><h2 id="performance-evaluation" class="first-section">Task definition and evaluation procedure</h2>{_report._procedure_grid_html(procedure)}
 <h2 id="performance-summary">Target performance overview</h2><p>Every target retains its task-appropriate primary metric. Values are mean ± SD across {"held-out datasets" if is_lodo_protocol(sweep.evaluation.protocol) else "outer test folds"}. Classification and regression metrics are intentionally not collapsed into a single heterogeneous score.</p>{_report._html_table(overview)}{_report._html_table(macro) if not macro.empty else ""}
+{pca_html}
 {joint_html}
 {sections}{_report._report_footer_html()}</main></div></body></html>'''
 
@@ -2105,6 +2391,9 @@ def write_multi_target_report(
 
     hardware_environment_path = tables_dir / "hardware_environment.parquet"
 
+    pca_stability_path = tables_dir / "pca_alignment_stability.parquet"
+    pca_example_predictions_path = tables_dir / "pca_example_subject_predictions.parquet"
+
     patient_detection_path = tables_dir / "multilabel_patient_positive_detection.parquet"
 
     healthy_control_path = tables_dir / "multilabel_healthy_control_exact_match.parquet"
@@ -2122,6 +2411,11 @@ def write_multi_target_report(
         if hardware_frames
         else pd.DataFrame(),
     )
+
+    if pca_spec is not None:
+        write_table(pca_stability_path, pca_stability)
+        if not pca_example.empty:
+            write_table(pca_example_predictions_path, pca_example)
 
     if task == "multilabel":
         write_table(patient_detection_path, patient_detection)
@@ -2143,6 +2437,12 @@ def write_multi_target_report(
                 }
                 for child in children
             ],
+            "pca_alignment_stability": (
+                pca_stability_path if pca_spec is not None else None
+            ),
+            "pca_example_subject_radar": (
+                pca_example_figure if pca_example_figure is not None else None
+            ),
             "root_report": html_path,
         },
         manifest_path,
@@ -2154,6 +2454,11 @@ def write_multi_target_report(
         "important_features": important_features_path,
         "hardware_environment": hardware_environment_path,
     }
+    if pca_spec is not None:
+        outputs["pca_alignment_stability"] = pca_stability_path
+        if pca_example_figure is not None:
+            outputs["pca_example_subject_radar"] = pca_example_figure
+            outputs["pca_example_subject_predictions"] = pca_example_predictions_path
     if task == "multilabel" and not patient_detection.empty:
         outputs["patient_positive_detection"] = patient_detection_path
     if task == "multilabel" and not healthy_control_accuracy.empty:
