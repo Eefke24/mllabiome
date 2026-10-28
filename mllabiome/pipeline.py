@@ -42,6 +42,14 @@ def _write_stage_manifest(
 
 
 def run_explore(sweep: Sweep) -> dict[str, Any]:
+    if (
+        not getattr(sweep, "uses_modalities", False)
+        and getattr(sweep.data, "fold_pca_target", None) is not None
+    ):
+        info(
+            "Explore skipped · fold-specific PCA targets do not have one global target vector."
+        )
+        return {}
     legacy_report = Path(sweep.root()) / "explore" / "index.html"
     if legacy_report.exists():
         legacy_report.unlink()
@@ -152,6 +160,14 @@ def run_inference(sweep: Sweep) -> dict[str, Any]:
 
 
 def run_explain(sweep: Sweep) -> dict[str, Any]:
+    if (
+        not getattr(sweep, "uses_modalities", False)
+        and getattr(sweep.data, "fold_pca_target", None) is not None
+    ):
+        info(
+            "Explainability skipped · regression explainability does not yet construct fold-specific PCA targets."
+        )
+        return {}
     if getattr(sweep, "uses_modalities", False):
         outputs = explain(sweep)
         print_stage_results(sweep, "explain")
@@ -181,6 +197,14 @@ def run_explain(sweep: Sweep) -> dict[str, Any]:
 
 def run_robustness(sweep: Sweep) -> dict[str, Any]:
     if getattr(sweep, "robustness", None) is None:
+        return {}
+    if (
+        not getattr(sweep, "uses_modalities", False)
+        and getattr(sweep.data, "fold_pca_target", None) is not None
+    ):
+        info(
+            "Robustness skipped · this stage expects a single fixed outcome vector, not fold-specific PCA targets."
+        )
         return {}
     if getattr(sweep, "uses_modalities", False):
         outputs = execute_robustness(sweep)
